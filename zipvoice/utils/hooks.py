@@ -1,3 +1,6 @@
+# start zipvoice/utils/hooks.py
+"""PyTorch hooks for detecting non-finite (inf/nan) values during training."""
+
 # Copyright  2021-2024  Xiaomi Corporation  (authors: Zengwei Yao,
 #                                                     Daniel Povey,
 #                                                     Zengrui Jin,)
@@ -16,22 +19,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
 import random
 
+import structlog
 import torch
 from torch import Tensor, nn
 
+log = structlog.get_logger()
 
-def register_inf_check_hooks(model: nn.Module) -> None:
-    """Registering forward hook on each module, to check
-    whether its output tensors is not finite.
+
+def register_inf_check_hooks(model: nn.Module) -> None:  # noqa: C901
+    """Register forward hooks on each module to check for non-finite outputs.
 
     Args:
       model:
         the model to be analyzed.
     """
-
     for name, module in model.named_modules():
         if name == "":
             name = "<top-level>"
@@ -42,7 +45,7 @@ def register_inf_check_hooks(model: nn.Module) -> None:
             if isinstance(_output, Tensor):
                 try:
                     if not torch.isfinite(_output.to(torch.float32).sum()):
-                        logging.warning(f"The sum of {_name}.output is not finite")
+                        log.warning("output_not_finite", module=_name)
                 except RuntimeError:  # e.g. CUDA out of memory
                     pass
             elif isinstance(_output, tuple):
@@ -53,9 +56,7 @@ def register_inf_check_hooks(model: nn.Module) -> None:
                         continue
                     try:
                         if not torch.isfinite(o.to(torch.float32).sum()):
-                            logging.warning(
-                                f"The sum of {_name}.output[{i}] is not finite"
-                            )
+                            log.warning("output_not_finite", module=_name, index=i)
                     except RuntimeError:  # e.g. CUDA out of memory
                         pass
 
@@ -65,7 +66,7 @@ def register_inf_check_hooks(model: nn.Module) -> None:
             if isinstance(_output, Tensor):
                 try:
                     if not torch.isfinite(_output.to(torch.float32).sum()):
-                        logging.warning(f"The sum of {_name}.grad is not finite")
+                        log.warning("grad_not_finite", module=_name)
                 except RuntimeError:  # e.g. CUDA out of memory
                     pass
 
@@ -76,7 +77,7 @@ def register_inf_check_hooks(model: nn.Module) -> None:
                     if not isinstance(o, Tensor):
                         continue
                     if not torch.isfinite(o.to(torch.float32).sum()):
-                        logging.warning(f"The sum of {_name}.grad[{i}] is not finite")
+                        log.warning("grad_not_finite", module=_name, index=i)
 
         module.register_forward_hook(forward_hook)
         module.register_backward_hook(backward_hook)
@@ -85,15 +86,12 @@ def register_inf_check_hooks(model: nn.Module) -> None:
 
         def param_backward_hook(grad, _name=name):
             if not torch.isfinite(grad.to(torch.float32).sum()):
-                logging.warning(f"The sum of {_name}.param_grad is not finite")
+                log.warning("param_grad_not_finite", param=_name)
 
         try:
             parameter.register_hook(param_backward_hook)
-        except Exception as e:
-            logging.warning(
-                f"Warning: could not register backward hook for parameter {name}"
-                f" with error {e}, it might not be differentiable."
-            )
+        except Exception as e:  # P8: intentional — hook errors must not crash the training loop
+            log.warning("hook_registration_failed", param=name, error=str(e))
 
 
 def _test_inf_check_hooks():
@@ -101,7 +99,7 @@ def _test_inf_check_hooks():
 
     register_inf_check_hooks(model)
     for _ in range(10):
-        T = random.randint(200, 300)
+        T = random.randint(200, 300)  # noqa: S311
         x = torch.randn(T, 100) + float("inf") * (T % 2)
         y = model(x)
         y.sum().backward()
@@ -109,3 +107,4 @@ def _test_inf_check_hooks():
 
 if __name__ == "__main__":
     _test_inf_check_hooks()
+# end zipvoice/utils/hooks.py

@@ -1,3 +1,6 @@
+"""TTSZipformerTwoStream: dual-stream Zipformer encoder for dialog TTS."""
+
+# start zipvoice/models/modules/zipformer_two_stream.py
 #!/usr/bin/env python3
 # Copyright    2025  Xiaomi Corp.        (authors: Han Zhu)
 #
@@ -16,7 +19,6 @@
 # limitations under the License.
 
 import math
-from typing import Optional, Tuple, Union
 
 import torch
 from torch import Tensor, nn
@@ -40,9 +42,7 @@ def timestep_embedding(timesteps, dim, max_period=10000):
     """
     half = dim // 2
     freqs = torch.exp(
-        -math.log(max_period)
-        * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device)
-        / half
+        -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32, device=timesteps.device) / half
     )
 
     if timesteps.dim() == 2:
@@ -56,8 +56,7 @@ def timestep_embedding(timesteps, dim, max_period=10000):
 
 
 class TTSZipformerTwoStream(TTSZipformer):
-    """
-    Args:
+    """Dual-stream TTS Zipformer for stereo/dialog synthesis.
 
     Note: all "int or Tuple[int]" arguments below will be treated as lists of the same
     length as downsampling_factor if they are single ints or one-element tuples.
@@ -89,13 +88,13 @@ class TTSZipformerTwoStream(TTSZipformer):
         time_embed_dim: (int): the dimension of the time embedding.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913, C901, PLR0915
         self,
-        in_dim: Tuple[int],
-        out_dim: Tuple[int],
-        downsampling_factor: Tuple[int] = (2, 4),
-        num_encoder_layers: Union[int, Tuple[int]] = 4,
-        cnn_module_kernel: Union[int, Tuple[int]] = 31,
+        in_dim: tuple[int, ...],
+        out_dim: tuple[int, ...],
+        downsampling_factor: tuple[int, ...] = (2, 4),
+        num_encoder_layers: int | tuple[int, ...] = 4,
+        cnn_module_kernel: int | tuple[int, ...] = 31,
         encoder_dim: int = 384,
         query_head_dim: int = 24,
         pos_head_dim: int = 4,
@@ -109,6 +108,7 @@ class TTSZipformerTwoStream(TTSZipformer):
         time_embed_dim: int = 192,
         use_conv: bool = True,
     ) -> None:
+        """Initialize TTSZipformerTwoStream."""
         nn.Module.__init__(self)
 
         if dropout is None:
@@ -117,25 +117,41 @@ class TTSZipformerTwoStream(TTSZipformer):
             downsampling_factor = (downsampling_factor,)
 
         def _to_tuple(x):
-            """Converts a single int or a 1-tuple of an int to a tuple with the same
-            length as downsampling_factor"""
+            """Converts a single int or 1-tuple to a tuple matching downsampling_factor length."""
             if isinstance(x, int):
                 x = (x,)
             if len(x) == 1:
                 x = x * len(downsampling_factor)
             else:
-                assert len(x) == len(downsampling_factor) and isinstance(x[0], int)
+                if not (len(x) == len(downsampling_factor) and isinstance(x[0], int)):
+                    msg = (
+                        f"Expected len(x) == len(downsampling_factor) and isinstance(x[0], int), "
+                        f"got len(x)={len(x)}, len(downsampling_factor)={len(downsampling_factor)}"
+                    )
+                    raise ValueError(msg)
             return x
 
         def _assert_downsampling_factor(factors):
-            """assert downsampling_factor follows u-net style"""
-            assert factors[0] == 1 and factors[-1] == 1
+            """Assert downsampling_factor follows u-net style."""
+            if not (factors[0] == 1 and factors[-1] == 1):
+                msg = f"downsampling_factor must start and end with 1, got {factors}"
+                raise ValueError(msg)
 
             for i in range(1, len(factors) // 2 + 1):
-                assert factors[i] == factors[i - 1] * 2
+                if factors[i] != factors[i - 1] * 2:
+                    msg = (
+                        f"downsampling_factor must double in first half: "
+                        f"factors[{i}]={factors[i]} != factors[{i - 1}]*2={factors[i - 1] * 2}"
+                    )
+                    raise ValueError(msg)
 
             for i in range(len(factors) // 2 + 1, len(factors)):
-                assert factors[i] * 2 == factors[i - 1]
+                if factors[i] * 2 != factors[i - 1]:
+                    msg = (
+                        f"downsampling_factor must halve in second half: "
+                        f"factors[{i}]*2={factors[i] * 2} != factors[{i - 1}]={factors[i - 1]}"
+                    )
+                    raise ValueError(msg)
 
         _assert_downsampling_factor(downsampling_factor)
         self.downsampling_factor = downsampling_factor  # tuple
@@ -151,20 +167,22 @@ class TTSZipformerTwoStream(TTSZipformer):
 
         self.time_embed_dim = time_embed_dim
         if self.use_time_embed:
-            assert time_embed_dim != -1
+            if time_embed_dim == -1:
+                msg = "time_embed_dim must not be -1 when use_time_embed is True"
+                raise ValueError(msg)
         else:
             time_embed_dim = -1
 
-        assert len(in_dim) == len(out_dim) == 2
+        if not (len(in_dim) == len(out_dim) == 2):
+            msg = (
+                f"Expected len(in_dim) == len(out_dim) == 2, got len(in_dim)={len(in_dim)}, len(out_dim)={len(out_dim)}"
+            )
+            raise ValueError(msg)
 
         self.in_dim = in_dim
-        self.in_proj = nn.ModuleList(
-            [nn.Linear(in_dim[0], encoder_dim), nn.Linear(in_dim[1], encoder_dim)]
-        )
+        self.in_proj = nn.ModuleList([nn.Linear(in_dim[0], encoder_dim), nn.Linear(in_dim[1], encoder_dim)])
         self.out_dim = out_dim
-        self.out_proj = nn.ModuleList(
-            [nn.Linear(encoder_dim, out_dim[0]), nn.Linear(encoder_dim, out_dim[1])]
-        )
+        self.out_proj = nn.ModuleList([nn.Linear(encoder_dim, out_dim[0]), nn.Linear(encoder_dim, out_dim[1])])
 
         # each one will be Zipformer2Encoder or DownsampledZipformer2Encoder
         encoders = []
@@ -219,10 +237,11 @@ class TTSZipformerTwoStream(TTSZipformer):
     def forward(
         self,
         x: Tensor,
-        t: Optional[Tensor] = None,
-        padding_mask: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, Tensor]:
-        """
+        t: Tensor | None = None,
+        padding_mask: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Run the two-stream forward pass.
+
         Args:
           x:
             The input tensor. Its shape is (batch_size, seq_len, feature_dim).
@@ -231,20 +250,22 @@ class TTSZipformerTwoStream(TTSZipformer):
           padding_mask:
             The mask for padding, of shape (batch_size, seq_len); True means
             masked position. May be None.
+
         Returns:
           Return the output embeddings. its shape is
-            (batch_size, output_seq_len, encoder_dim)
+            (batch_size, output_seq_len, encoder_dim).
         """
-        assert x.size(2) in self.in_dim, f"{x.size(2)} in {self.in_dim}"
-        if x.size(2) == self.in_dim[0]:
-            index = 0
-        else:
-            index = 1
+        if x.size(2) not in self.in_dim:
+            msg = f"{x.size(2)} not in {self.in_dim}"
+            raise ValueError(msg)
+        index = 0 if x.size(2) == self.in_dim[0] else 1
         x = x.permute(1, 0, 2)
         x = self.in_proj[index](x)
 
         if t is not None:
-            assert t.dim() == 1 or t.dim() == 2, t.shape
+            if t.dim() != 1 and t.dim() != 2:
+                msg = f"Expected t.dim() == 1 or 2, got {t.dim()}, shape={t.shape}"
+                raise ValueError(msg)
             time_emb = timestep_embedding(t, self.time_embed_dim)
             time_emb = self.time_embed(time_emb)
         else:
@@ -252,7 +273,7 @@ class TTSZipformerTwoStream(TTSZipformer):
 
         attn_mask = None
 
-        for i, module in enumerate(self.encoders):
+        for _i, module in enumerate(self.encoders):
             x = module(
                 x,
                 time_emb=time_emb,
@@ -262,3 +283,6 @@ class TTSZipformerTwoStream(TTSZipformer):
         x = self.out_proj[index](x)
         x = x.permute(1, 0, 2)
         return x
+
+
+# end zipvoice/models/modules/zipformer_two_stream.py

@@ -1,7 +1,7 @@
-import argparse
+# start zipvoice/utils/common.py
+"""Common utility classes and functions for ZipVoice training and inference."""
+
 import collections
-import json
-import logging
 import os
 import socket
 import subprocess
@@ -11,58 +11,69 @@ from collections import defaultdict
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Tuple, Union
+from typing import Any
 
+import orjson
+import structlog
 import torch
 from packaging import version
 from torch import distributed as dist
 from torch import nn
+from torch.amp import GradScaler  # noqa: F401  # re-exported for checkpoint.py
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
 
+Pathlike = str | Path
 
-if hasattr(torch.amp, "GradScaler"):
-    from torch.amp import GradScaler
-else:
-    from torch.cuda.amp import GradScaler
-
-Pathlike = Union[str, Path]
+log = structlog.get_logger()
 
 
 class AttributeDict(dict):
+    """A dict subclass that allows attribute-style access to its keys."""
+
     def __getattr__(self, key):
+        """Return the value for key, or raise AttributeError if missing."""
         if key in self:
             return self[key]
-        raise AttributeError(f"No such attribute '{key}'")
+        msg = f"No such attribute '{key}'"
+        raise AttributeError(msg)
 
     def __setattr__(self, key, value):
+        """Set key to value in the underlying dict."""
         self[key] = value
 
     def __delattr__(self, key):
+        """Delete key from the underlying dict, or raise AttributeError."""
         if key in self:
             del self[key]
             return
-        raise AttributeError(f"No such attribute '{key}'")
+        msg = f"No such attribute '{key}'"
+        raise AttributeError(msg)
 
     def __str__(self, indent: int = 2):
+        """Return a JSON-formatted string of the dict."""
         tmp = {}
         for k, v in self.items():
             # PosixPath is ont JSON serializable
             if isinstance(v, (Path, torch.device, torch.dtype)):
                 v = str(v)
             tmp[k] = v
-        return json.dumps(tmp, indent=indent, sort_keys=True)
+        return orjson.dumps(tmp, option=orjson.OPT_INDENT_2 | orjson.OPT_SORT_KEYS).decode()
 
 
 class MetricsTracker(collections.defaultdict):
+    """A defaultdict subclass for tracking training metrics keyed by name."""
+
     def __init__(self):
+        """Initialize with int default factory so missing keys return 0."""
         # Passing the type 'int' to the base-class constructor
         # makes undefined items default to int() which is zero.
         # This class will play a role as metrics tracker.
         # It can record many metrics, including but not limited to loss.
-        super(MetricsTracker, self).__init__(int)
+        super().__init__(int)
 
     def __add__(self, other: "MetricsTracker") -> "MetricsTracker":
+        """Return element-wise sum of two MetricsTrackers."""
         ans = MetricsTracker()
         for k, v in self.items():
             ans[k] = v
@@ -72,16 +83,18 @@ class MetricsTracker(collections.defaultdict):
         return ans
 
     def __mul__(self, alpha: float) -> "MetricsTracker":
+        """Return a new MetricsTracker with all values scaled by alpha."""
         ans = MetricsTracker()
         for k, v in self.items():
             ans[k] = v * alpha
         return ans
 
     def __str__(self) -> str:
+        """Return a human-readable summary string of normalized metrics."""
         ans_frames = ""
         ans_utterances = ""
         for k, v in self.norm_items():
-            norm_value = "%.4g" % v
+            norm_value = f"{v:.4g}"
             if "utt_" not in k:
                 ans_frames += str(k) + "=" + str(norm_value) + ", "
             else:
@@ -91,41 +104,41 @@ class MetricsTracker(collections.defaultdict):
                 elif k == "utt_pad_proportion":
                     ans_utterances += ", "
                 else:
-                    raise ValueError(f"Unexpected key: {k}")
-        frames = "%.2f" % self["frames"]
+                    msg = f"Unexpected key: {k}"
+                    raise ValueError(msg)
+        frames = "{:.2f}".format(self["frames"])
         ans_frames += "over " + str(frames) + " frames. "
         if ans_utterances != "":
-            utterances = "%.2f" % self["utterances"]
+            utterances = "{:.2f}".format(self["utterances"])
             ans_utterances += "over " + str(utterances) + " utterances."
 
         return ans_frames + ans_utterances
 
-    def norm_items(self) -> List[Tuple[str, float]]:
+    def norm_items(self) -> list[tuple[str, float]]:
+        """Return a list of pairs like [('ctc_loss', 0.1), ('att_loss', 0.07)].
+
+        Values are normalized by frame or utterance count.
         """
-        Returns a list of pairs, like:
-          [('ctc_loss', 0.1), ('att_loss', 0.07)]
-        """
-        num_frames = self["frames"] if "frames" in self else 1
-        num_utterances = self["utterances"] if "utterances" in self else 1
+        num_frames = self.get("frames", 1)
+        num_utterances = self.get("utterances", 1)
         ans = []
         for k, v in self.items():
             if k == "frames" or k == "utterances":
                 continue
-            norm_value = (
-                float(v) / num_frames if "utt_" not in k else float(v) / num_utterances
-            )
+            norm_value = float(v) / num_frames if "utt_" not in k else float(v) / num_utterances
             ans.append((k, norm_value))
         return ans
 
     def reduce(self, device):
-        """
-        Reduce using torch.distributed, which I believe ensures that
-        all processes get the total.
+        """Reduce metrics across all distributed processes using all-reduce.
+
+        Args:
+            device: The device to use for the reduction tensor.
         """
         keys = sorted(self.keys())
         s = torch.tensor([float(self[k]) for k in keys], device=device)
         dist.all_reduce(s, op=dist.ReduceOp.SUM)
-        for k, v in zip(keys, s.cpu().tolist()):
+        for k, v in zip(keys, s.cpu().tolist(), strict=False):
             self[k] = v
 
     def write_summary(
@@ -148,11 +161,10 @@ class MetricsTracker(collections.defaultdict):
 
 @contextmanager
 def torch_autocast(device_type="cuda", **kwargs):
-    """
-    To fix the following warnings:
-    FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated.
-    Please use `torch.amp.autocast('cuda', args...)` instead.
-      with torch.cuda.amp.autocast(enabled=False):
+    """Context manager that wraps torch.amp.autocast with version compatibility.
+
+    Fixes FutureWarning: ``torch.cuda.amp.autocast(args...)`` is deprecated.
+    Please use ``torch.amp.autocast('cuda', args...)`` instead.
     """
     if version.parse(torch.__version__) >= version.parse("2.3.0"):
         # Use new unified API
@@ -167,12 +179,10 @@ def torch_autocast(device_type="cuda", **kwargs):
 
 
 def create_grad_scaler(device="cuda", **kwargs):
-    """
-    Creates a GradScaler compatible with both torch < 2.3.0 and >= 2.3.0.
-    Accepts all kwargs like: enabled, init_scale, growth_factor, etc.
+    """Create a GradScaler compatible with both torch < 2.3.0 and >= 2.3.0.
 
-    FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated.
-    Please use `torch.amp.GradScaler('cuda', args...)` instead.
+    Accepts all kwargs like: enabled, init_scale, growth_factor, etc.
+    Suppresses the FutureWarning about deprecated ``torch.cuda.amp.GradScaler``.
     """
     if version.parse(torch.__version__) >= version.parse("2.3.0"):
         from torch.amp import GradScaler
@@ -191,15 +201,13 @@ def setup_dist(
     use_ddp_launch=False,
     master_addr=None,
 ):
-    """
-    rank and world_size are used only if use_ddp_launch is False.
-    """
+    """Rank and world_size are used only if use_ddp_launch is False."""
     if "MASTER_ADDR" not in os.environ:
-        os.environ["MASTER_ADDR"] = (
-            "localhost" if master_addr is None else str(master_addr)
-        )
+        # NOTE: Required for PyTorch DDP; env vars are the only interface
+        os.environ["MASTER_ADDR"] = "localhost" if master_addr is None else str(master_addr)
 
     if "MASTER_PORT" not in os.environ:
+        # NOTE: Required for PyTorch DDP; env vars are the only interface
         os.environ["MASTER_PORT"] = "12354" if master_port is None else str(master_port)
 
     if use_ddp_launch is False:
@@ -210,10 +218,11 @@ def setup_dist(
 
 
 def cleanup_dist():
+    """Destroy the distributed process group."""
     dist.destroy_process_group()
 
 
-def prepare_input(
+def prepare_input(  # noqa: PLR0913
     params: AttributeDict,
     batch: dict,
     device: torch.device,
@@ -221,17 +230,22 @@ def prepare_input(
     return_feature: bool = True,
     return_audio: bool = False,
 ):
-    """
-    Parse the features and targets of the current batch.
+    """Parse the features and targets of the current batch.
+
     Args:
       params:
         It is returned by :func:`get_params`.
       batch:
         It is the return value from iterating
-        `lhotse.dataset.K2SpeechRecognitionDataset`. See its documentation
-        for the format of the `batch`.
+        ``lhotse.dataset.K2SpeechRecognitionDataset``.
       device:
         The device of Tensor.
+      return_tokens:
+        Whether to include token tensors in the output.
+      return_feature:
+        Whether to include feature tensors in the output.
+      return_audio:
+        Whether to include raw audio tensors in the output.
     """
     return_list = []
 
@@ -250,6 +264,15 @@ def prepare_input(
 
 
 def prepare_avg_tokens_durations(features_lens, tokens_lens):
+    """Compute average token durations for each utterance.
+
+    Args:
+        features_lens: Tensor of feature (frame) lengths per utterance.
+        tokens_lens: Tensor of token counts per utterance.
+
+    Returns:
+        List of per-token duration lists.
+    """
     tokens_durations = []
     for i in range(len(features_lens)):
         utt_duration = features_lens[i]
@@ -258,12 +281,13 @@ def prepare_avg_tokens_durations(features_lens, tokens_lens):
     return tokens_durations
 
 
-def pad_labels(y: List[List[int]], pad_id: int, device: torch.device):
-    """
-    Pad the transcripts to the same length with zeros.
+def pad_labels(y: list[list[int]], pad_id: int, device: torch.device):
+    """Pad the transcripts to the same length with a padding id.
 
     Args:
-      y: the transcripts, which is a list of a list
+      y: The transcripts, which is a list of a list of token ids.
+      pad_id: The padding token id to fill with.
+      device: The device to place the output tensor on.
 
     Returns:
       Return a Tensor of padded transcripts.
@@ -274,10 +298,10 @@ def pad_labels(y: List[List[int]], pad_id: int, device: torch.device):
     return torch.tensor(y, dtype=torch.int64, device=device)
 
 
-def get_tokens_index(durations: List[List[int]], num_frames: int) -> torch.Tensor:
-    """
-    Gets position in the transcript for each frame, i.e. the position
-    in the symbol-sequence to look up.
+def get_tokens_index(durations: list[list[int]], num_frames: int) -> torch.Tensor:
+    """Get the position in the transcript for each frame.
+
+    Returns the position in the symbol-sequence to look up.
 
     Args:
       durations:
@@ -297,27 +321,46 @@ def get_tokens_index(durations: List[List[int]], num_frames: int) -> torch.Tenso
         for i, d in enumerate(this_dur):
             ans[b, cur_frame : cur_frame + d] = i
             cur_frame += d
-        assert cur_frame == num_frames, (cur_frame, num_frames)
+        if cur_frame != num_frames:
+            msg = f"cur_frame {cur_frame} != num_frames {num_frames}"
+            raise RuntimeError(msg)
     return ans
 
 
-def to_int_tuple(s: Union[str, int]):
+def to_int_tuple(s: str | int):
+    """Convert a string of comma-separated ints or a single int to a tuple.
+
+    Args:
+        s: A single integer or a comma-separated string of integers.
+
+    Returns:
+        A tuple of integers.
+    """
     if isinstance(s, int):
         return (s,)
     return tuple(map(int, s.split(",")))
 
 
 def get_adjusted_batch_count(params: AttributeDict) -> float:
-    # returns the number of batches we would have used so far if we had used the
-    # reference duration.  This is for purposes of set_batch_count().
-    return (
-        params.batch_idx_train
-        * (params.max_duration * params.world_size)
-        / params.ref_duration
-    )
+    """Return equivalent batch count if the reference duration had been used.
+
+    Args:
+        params: Training parameters containing batch_idx_train, max_duration,
+            world_size, and ref_duration.
+
+    Returns:
+        Adjusted batch count for use with set_batch_count().
+    """
+    return params.batch_idx_train * (params.max_duration * params.world_size) / params.ref_duration
 
 
-def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
+def set_batch_count(model: nn.Module | DDP, batch_count: float) -> None:
+    """Set the batch_count attribute on all submodules that have it.
+
+    Args:
+        model: The model whose submodules should be updated.
+        batch_count: The current batch count to set.
+    """
     if isinstance(model, DDP):
         # get underlying nn.Module
         model = model.module
@@ -330,81 +373,75 @@ def set_batch_count(model: Union[nn.Module, DDP], batch_count: float) -> None:
 
 def condition_time_mask(
     features_lens: torch.Tensor,
-    mask_percent: Tuple[float, float],
+    mask_percent: tuple[float, float],
     max_len: int = 0,
 ) -> torch.Tensor:
-    """
-    Apply Time masking.
+    """Apply random time masking.
+
     Args:
         features_lens:
             input tensor of shape ``(B)``
-        mask_size:
-            the width size for masking.
+        mask_percent:
+            A (min, max) tuple for the fraction of frames to mask.
         max_len:
             the maximum length of the mask.
+
     Returns:
         Return a 2-D bool tensor (B, T), where masked positions
         are filled with `True` and non-masked positions are
         filled with `False`.
     """
-    mask_size = (
-        torch.zeros_like(features_lens, dtype=torch.float32).uniform_(*mask_percent)
-        * features_lens
-    ).to(torch.int64)
-    mask_starts = (
-        torch.rand_like(mask_size, dtype=torch.float32) * (features_lens - mask_size)
-    ).to(torch.int64)
+    mask_size = (torch.zeros_like(features_lens, dtype=torch.float32).uniform_(*mask_percent) * features_lens).to(
+        torch.int64
+    )
+    mask_starts = (torch.rand_like(mask_size, dtype=torch.float32) * (features_lens - mask_size)).to(torch.int64)
     mask_ends = mask_starts + mask_size
     max_len = max(max_len, features_lens.max())
     seq_range = torch.arange(0, max_len, device=features_lens.device)
-    mask = (seq_range[None, :] >= mask_starts[:, None]) & (
-        seq_range[None, :] < mask_ends[:, None]
-    )
+    mask = (seq_range[None, :] >= mask_starts[:, None]) & (seq_range[None, :] < mask_ends[:, None])
     return mask
 
 
 def condition_time_mask_suffix(
     features_lens: torch.Tensor,
-    mask_percent: Tuple[float, float],
+    mask_percent: tuple[float, float],
     max_len: int = 0,
 ) -> torch.Tensor:
-    """
-    Apply Time masking, mask from the end time index.
+    """Apply time masking from the end time index.
+
     Args:
         features_lens:
             input tensor of shape ``(B)``
-        mask_size:
-            the width size for masking.
+        mask_percent:
+            A (min, max) tuple for the fraction of frames to mask.
         max_len:
             the maximum length of the mask.
+
     Returns:
         Return a 2-D bool tensor (B, T), where masked positions
         are filled with `True` and non-masked positions are
         filled with `False`.
     """
-    mask_size = (
-        torch.zeros_like(features_lens, dtype=torch.float32).uniform_(*mask_percent)
-        * features_lens
-    ).to(torch.int64)
-    mask_starts = (
-        torch.ones_like(mask_size, dtype=torch.float32) * (features_lens - mask_size)
-    ).to(torch.int64)
+    mask_size = (torch.zeros_like(features_lens, dtype=torch.float32).uniform_(*mask_percent) * features_lens).to(
+        torch.int64
+    )
+    mask_starts = (torch.ones_like(mask_size, dtype=torch.float32) * (features_lens - mask_size)).to(torch.int64)
     mask_ends = mask_starts + mask_size
     max_len = max(max_len, features_lens.max())
     seq_range = torch.arange(0, max_len, device=features_lens.device)
-    mask = (seq_range[None, :] >= mask_starts[:, None]) & (
-        seq_range[None, :] < mask_ends[:, None]
-    )
+    mask = (seq_range[None, :] >= mask_starts[:, None]) & (seq_range[None, :] < mask_ends[:, None])
     return mask
 
 
 def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
-    """
+    """Create a padding mask from a lengths tensor.
+
     Args:
       lengths:
         A 1-D tensor containing sentence lengths.
       max_len:
         The length of masks.
+
     Returns:
       Return a 2-D bool tensor, where masked positions
       are filled with `True` and non-masked positions are
@@ -417,7 +454,9 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
             [False, False,  True,  True,  True],
             [False, False, False, False, False]])
     """
-    assert lengths.ndim == 1, lengths.ndim
+    if lengths.ndim != 1:
+        msg = f"Expected 1-D tensor, got ndim={lengths.ndim}"
+        raise ValueError(msg)
     max_len = max(max_len, lengths.max())
     n = lengths.size(0)
     seq_range = torch.arange(0, max_len, device=lengths.device)
@@ -426,23 +465,28 @@ def make_pad_mask(lengths: torch.Tensor, max_len: int = 0) -> torch.Tensor:
     return expaned_lengths >= lengths.unsqueeze(-1)
 
 
-def str2bool(v):
-    """Used in argparse.ArgumentParser.add_argument to indicate
-    that a type is a bool type and user can enter
+def str2bool(v: str | bool) -> bool:
+    """Convert a string representation of a boolean to an actual bool.
 
-        - yes, true, t, y, 1, to represent True
-        - no, false, f, n, 0, to represent False
+    Accepts: yes/true/t/y/1 for True; no/false/f/n/0 for False.
 
-    See https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse  # noqa
+    Args:
+        v: String or bool value to convert.
+
+    Returns:
+        Boolean result.
+
+    Raises:
+        ValueError: If the string is not a recognised boolean representation.
     """
     if isinstance(v, bool):
         return v
     if v.lower() in ("yes", "true", "t", "y", "1"):
         return True
-    elif v.lower() in ("no", "false", "f", "n", "0"):
+    if v.lower() in ("no", "false", "f", "n", "0"):
         return False
-    else:
-        raise argparse.ArgumentTypeError("Boolean value expected.")
+    msg = f"Boolean value expected, got: {v!r}"
+    raise ValueError(msg)
 
 
 def setup_logger(
@@ -474,6 +518,8 @@ def setup_logger(
 
     os.makedirs(os.path.dirname(log_filename), exist_ok=True)
 
+    import logging  # stdlib backend for structlog — kept local to avoid module-level ban
+
     level = logging.ERROR
     if log_level == "debug":
         level = logging.DEBUG
@@ -499,10 +545,15 @@ def setup_logger(
 
 
 def get_git_sha1():
+    """Return the short git SHA1 of the current commit, or None on error.
+
+    Returns:
+        Short git commit hash string like '1a2b3c4-clean', or None if unavailable.
+    """
     try:
         git_commit = (
             subprocess.run(
-                ["git", "rev-parse", "--short", "HEAD"],
+                ["git", "rev-parse", "--short", "HEAD"],  # noqa: S607
                 check=True,
                 stdout=subprocess.PIPE,
             )
@@ -513,7 +564,7 @@ def get_git_sha1():
         dirty_commit = (
             len(
                 subprocess.run(
-                    ["git", "diff", "--shortstat"],
+                    ["git", "diff", "--shortstat"],  # noqa: S607
                     check=True,
                     stdout=subprocess.PIPE,
                 )
@@ -524,17 +575,22 @@ def get_git_sha1():
             > 0
         )
         git_commit = git_commit + "-dirty" if dirty_commit else git_commit + "-clean"
-    except:  # noqa
+    except subprocess.CalledProcessError:
         return None
 
     return git_commit
 
 
 def get_git_date():
+    """Return the git date of the last commit, or None on error.
+
+    Returns:
+        Git date string, or None if unavailable.
+    """
     try:
         git_date = (
             subprocess.run(
-                ["git", "log", "-1", "--format=%ad", "--date=local"],
+                ["git", "log", "-1", "--format=%ad", "--date=local"],  # noqa: S607
                 check=True,
                 stdout=subprocess.PIPE,
             )
@@ -542,17 +598,22 @@ def get_git_date():
             .rstrip("\n")
             .strip()
         )
-    except:  # noqa
+    except subprocess.CalledProcessError:
         return None
 
     return git_date
 
 
 def get_git_branch_name():
+    """Return the current git branch name, or None on error.
+
+    Returns:
+        Branch name string, or None if unavailable.
+    """
     try:
         git_date = (
             subprocess.run(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],  # noqa: S607
                 check=True,
                 stdout=subprocess.PIPE,
             )
@@ -560,13 +621,13 @@ def get_git_branch_name():
             .rstrip("\n")
             .strip()
         )
-    except:  # noqa
+    except subprocess.CalledProcessError:
         return None
 
     return git_date
 
 
-def get_env_info() -> Dict[str, Any]:
+def get_env_info() -> dict[str, Any]:
     """Get the environment information."""
     return {
         "torch-version": str(torch.__version__),
@@ -582,14 +643,15 @@ def get_env_info() -> Dict[str, Any]:
     }
 
 
-def get_parameter_groups_with_lrs(
+def get_parameter_groups_with_lrs(  # noqa: C901, PLR0912
     model: nn.Module,
     lr: float,
     include_names: bool = False,
-    freeze_modules: List[str] = [],
-    unfreeze_modules: List[str] = [],
-) -> List[dict]:
-    """
+    freeze_modules: list[str] = None,
+    unfreeze_modules: list[str] = None,
+) -> list[dict]:
+    """Build parameter groups with per-module learning-rate scaling for ScaledAdam.
+
     This is for use with the ScaledAdam optimizers (more recent versions that accept
     lists of named-parameters; we can, if needed, create a version without the names).
 
@@ -612,7 +674,13 @@ def get_parameter_groups_with_lrs(
 
     """
     # Use freeze_modules or unfreeze_modules to freeze or unfreeze modules
-    assert not (len(freeze_modules) and len(unfreeze_modules))
+    if unfreeze_modules is None:
+        unfreeze_modules = []
+    if freeze_modules is None:
+        freeze_modules = []
+    if len(freeze_modules) and len(unfreeze_modules):
+        msg = "freeze_modules and unfreeze_modules are mutually exclusive; specify only one."
+        raise ValueError(msg)
 
     # flat_lr_scale just contains the lr_scale explicitly specified
     # for each prefix of the name, e.g. 'encoder.layers.3', these need
@@ -631,7 +699,7 @@ def get_parameter_groups_with_lrs(
 
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
-            logging.info(f"Remove {name} from parameter")
+            log.info("remove_param_no_grad", name=name)
             continue
         split_name = name.split(".")
         # caution: as a special case, if the name is '', split_name will be [ '' ].
@@ -640,21 +708,21 @@ def get_parameter_groups_with_lrs(
             if prefix == "module":  # DDP
                 module_name = split_name[1]
                 if module_name in freeze_modules:
-                    logging.info(f"Remove {name} from parameters")
+                    log.info("remove_frozen_param", name=name)
                     continue
             else:
                 if prefix in freeze_modules:
-                    logging.info(f"Remove {name} from parameters")
+                    log.info("remove_frozen_param", name=name)
                     continue
         elif len(unfreeze_modules) > 0:
             if prefix == "module":  # DDP
                 module_name = split_name[1]
                 if module_name not in unfreeze_modules:
-                    logging.info(f"Remove {name} from parameters")
+                    log.info("remove_non_unfrozen_param", name=name)
                     continue
             else:
                 if prefix not in unfreeze_modules:
-                    logging.info(f"Remove {name} from parameters")
+                    log.info("remove_non_unfrozen_param", name=name)
                     continue
         cur_lr = lr * flat_lr_scale[prefix]
         if prefix != "":
@@ -668,3 +736,6 @@ def get_parameter_groups_with_lrs(
         return [{"named_params": pairs, "lr": lr} for lr, pairs in lr_to_params.items()]
     else:
         return [{"params": params, "lr": lr} for lr, params in lr_to_params.items()]
+
+
+# end zipvoice/utils/common.py

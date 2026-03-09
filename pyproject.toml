@@ -3,7 +3,7 @@ name = "Zipvoice"
 version = "0.0.11"
 description = "Linacodec is a highly compressive and rapid audio tokenizer for audio models."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = [
   "cn2an",
   "huggingface-hub",
@@ -13,17 +13,27 @@ dependencies = [
   "librosa",
   "linacodec",
   "numpy",
+  "onnx",
   "onnxruntime",
+  "orjson",
   "piper-phonemize",
+  "pydantic",
+  "pydantic-settings",
   "pydub",
   "pypinyin",
+  "pyyaml",
+  "rich",
   "safetensors",
   "setuptools<81",
+  "stamina",
+  "structlog",
   "tensorboard",
   "torch",
+  "typer",
   "torchaudio",
   "transformers<=4.57.6",
   "vocos",
+  "torchcodec>=0.10.0",
 ]
 
 [project.optional-dependencies]
@@ -35,8 +45,96 @@ train = [
 requires = ["uv_build>=0.9.6,<0.10.0"]
 build-backend = "uv_build"
 
+[dependency-groups]
+dev = [
+  "ruff",
+  "mypy",
+  "pytest",
+  "pytest-cov",
+  "radon",
+  "bandit",
+  "interrogate",
+  "deptry",
+  "pytest-httpx",
+]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+ignore_missing_imports = true
+
+# Pre-existing complex ML files use untyped third-party libraries (torch internals,
+# lhotse, linacodec, cn2an, inflect, etc.) that cannot be typed without massive effort.
+# These overrides allow gradual typing adoption while keeping strict mode for new code.
+[[tool.mypy.overrides]]
+module = [
+  "zipvoice.bin.compute_fbank",
+  "zipvoice.bin.generate_averaged_model",
+  "zipvoice.bin.infer_zipvoice",
+  "zipvoice.bin.infer_zipvoice_dialog",
+  "zipvoice.bin.infer_zipvoice_onnx",
+  "zipvoice.bin.onnx_export",
+  "zipvoice.bin.prepare_dataset",
+  "zipvoice.bin.prepare_tokens",
+  "zipvoice.bin.tensorrt_export",
+  "zipvoice.bin.train_zipvoice",
+  "zipvoice.bin.train_zipvoice_dialog",
+  "zipvoice.bin.train_zipvoice_dialog_stereo",
+  "zipvoice.bin.train_zipvoice_distill",
+  "zipvoice.config",
+  "zipvoice.models.modules.scaling",
+  "zipvoice.models.modules.scaling._activations",
+  "zipvoice.models.modules.scaling._normalization",
+  "zipvoice.models.modules.scaling._piecewise",
+  "zipvoice.models.modules.solver",
+  "zipvoice.models.modules.zipformer_two_stream",
+  "zipvoice.models.modules.zipformer._attention",
+  "zipvoice.models.modules.zipformer._conv",
+  "zipvoice.models.modules.zipformer._encoder",
+  "zipvoice.models.zipvoice",
+  "zipvoice.models.zipvoice_dialog",
+  "zipvoice.models.zipvoice_distill",
+  "zipvoice.tokenizer.normalizer",
+  "zipvoice.tokenizer.tokenizer",
+  "zipvoice.utils.checkpoint",
+  "zipvoice.utils.common",
+  "zipvoice.utils.diagnostics",
+  "zipvoice.utils.feature",
+  "zipvoice.utils.hooks",
+  "zipvoice.utils.infer",
+  "zipvoice.utils.lr_scheduler",
+  "zipvoice.utils.optim",
+  "zipvoice.utils.scaling_converter",
+  "zipvoice.utils.tensorrt",
+]
+ignore_errors = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.ruff]
 line-length = 120
+
+[tool.ruff.lint]
+select = ["E","W","F","B","I","UP","TRY","SIM","FURB","PIE790","ARG","C901","PLR0911","PLR0912","PLR0913","PLR0915","S","TCH","D"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 5
+max-returns = 6
+max-branches = 12
+max-statements = 50
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.deptry]
+# tacotron_cleaner/sentencepiece/tensorrt are optional platform-specific deps
+# setuptools needed for build compat; tensorboard used via CLI; einops is optional train extra
+# zipvoice self-imports are expected; packaging is a transitive dep of installed tools
+per_rule_ignores = { DEP001 = ["tacotron_cleaner", "sentencepiece", "tensorrt", "k2"], DEP002 = ["setuptools", "tensorboard", "einops", "torchcodec"], DEP003 = ["zipvoice", "packaging"] }
 
 [tool.uv]
 find-links = ["https://k2-fsa.github.io/icefall/piper_phonemize.html"]

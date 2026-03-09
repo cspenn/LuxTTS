@@ -30,25 +30,35 @@ You can try it locally, colab, or spaces.
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1cDaxtbSDLRmu6tRV_781Of_GSjHSo1Cu?usp=sharing)
 [![Open in Spaces](https://huggingface.co/datasets/huggingface/badges/resolve/main/open-in-hf-spaces-sm.svg)](https://huggingface.co/spaces/YatharthS/LuxTTS)
 
-#### Simple installation:
+#### Simple installation (Python 3.11+ required):
 ```
 git clone https://github.com/ysharma3501/LuxTTS.git
 cd LuxTTS
-pip install -r requirements.txt
+uv sync
+```
+
+Or with pip:
+```
+pip install zipvoice
+```
+
+#### CLI usage:
+```bash
+python main.py --text "Hello world" --output output.wav --prompt reference.wav
+python main.py --help   # see all options
 ```
 
 #### Load model:
 ```python
 from zipvoice.luxvoice import LuxTTS
 
-# load model on GPU
-lux_tts = LuxTTS('YatharthS/LuxTTS', device='cuda')
+# auto-detect best device (CUDA → MPS → CPU) — recommended
+lux_tts = LuxTTS('YatharthS/LuxTTS')
 
-# load model on CPU
-# lux_tts = LuxTTS('YatharthS/LuxTTS', device='cpu', threads=2)
-
-# load model on MPS for macs
-# lux_tts = LuxTTS('YatharthS/LuxTTS', device='mps')
+# or specify explicitly:
+# lux_tts = LuxTTS('YatharthS/LuxTTS', device='cuda')   # NVIDIA GPU
+# lux_tts = LuxTTS('YatharthS/LuxTTS', device='mps')    # Apple Silicon
+# lux_tts = LuxTTS('YatharthS/LuxTTS', device='cpu', threads=2)  # CPU-only
 ```
 
 #### Simple inference

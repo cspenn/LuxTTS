@@ -1,3 +1,6 @@
+"""ZipVoice: flow-matching TTS model with text and speech conditioning."""
+
+# start zipvoice/models/zipvoice.py
 # Copyright    2024    Xiaomi Corp.        (authors:  Wei Kang
 #                                                     Han Zhu)
 #
@@ -14,8 +17,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-from typing import List, Optional
 
 import torch
 import torch.nn as nn
@@ -35,11 +36,11 @@ from zipvoice.utils.common import (
 class ZipVoice(nn.Module):
     """The ZipVoice model."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
-        fm_decoder_downsampling_factor: List[int] = [1, 2, 4, 2, 1],
-        fm_decoder_num_layers: List[int] = [2, 2, 4, 4, 4],
-        fm_decoder_cnn_module_kernel: List[int] = [31, 15, 7, 15, 31],
+        fm_decoder_downsampling_factor: list[int] = None,
+        fm_decoder_num_layers: list[int] = None,
+        fm_decoder_cnn_module_kernel: list[int] = None,
         fm_decoder_feedforward_dim: int = 1536,
         fm_decoder_num_heads: int = 4,
         fm_decoder_dim: int = 512,
@@ -58,8 +59,7 @@ class ZipVoice(nn.Module):
         vocab_size: int = 26,
         pad_id: int = 0,
     ):
-        """
-        Initialize the model with specified configuration parameters.
+        """Initialize the model with specified configuration parameters.
 
         Args:
             fm_decoder_downsampling_factor: List of downsampling factors for each layer
@@ -90,6 +90,12 @@ class ZipVoice(nn.Module):
             vocab_size: Size of the vocabulary.
             pad_id: ID used for padding tokens.
         """
+        if fm_decoder_cnn_module_kernel is None:
+            fm_decoder_cnn_module_kernel = [31, 15, 7, 15, 31]
+        if fm_decoder_num_layers is None:
+            fm_decoder_num_layers = [2, 2, 4, 4, 4]
+        if fm_decoder_downsampling_factor is None:
+            fm_decoder_downsampling_factor = [1, 2, 4, 2, 1]
         super().__init__()
 
         self.fm_decoder = TTSZipformer(
@@ -132,16 +138,17 @@ class ZipVoice(nn.Module):
         self.embed = nn.Embedding(vocab_size, text_embed_dim)
         self.solver = EulerSolver(self, func_name="forward_fm_decoder")
 
-    def forward_fm_decoder(
+    def forward_fm_decoder(  # noqa: PLR0913
         self,
         t: torch.Tensor,
         xt: torch.Tensor,
         text_condition: torch.Tensor,
         speech_condition: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        guidance_scale: Optional[torch.Tensor] = None,
+        padding_mask: torch.Tensor | None = None,
+        guidance_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute velocity.
+
         Args:
             t:  A tensor of shape (N, 1, 1) or a tensor of a float,
                 in the range of (0, 1).
@@ -159,10 +166,11 @@ class ZipVoice(nn.Module):
         Returns:
             predicted velocity, with the shape (batch, seq_len, emb_dim).
         """
-
         xt = torch.cat([xt, text_condition, speech_condition], dim=2)
 
-        assert t.dim() in (0, 3)
+        if t.dim() not in (0, 3):
+            msg = f"t must have 0 or 3 dimensions, got {t.dim()}"
+            raise ValueError(msg)
         # Handle t with the shape (N, 1, 1):
         # squeeze the last dimension if it's size is 1.
         while t.dim() > 1 and t.size(-1) == 1:
@@ -177,38 +185,31 @@ class ZipVoice(nn.Module):
             if guidance_scale.dim() == 0:
                 guidance_scale = guidance_scale.repeat(xt.shape[0])
 
-            vt = self.fm_decoder(
-                x=xt, t=t, padding_mask=padding_mask, guidance_scale=guidance_scale
-            )
+            vt = self.fm_decoder(x=xt, t=t, padding_mask=padding_mask, guidance_scale=guidance_scale)
         else:
             vt = self.fm_decoder(x=xt, t=t, padding_mask=padding_mask)
         return vt
 
     def forward_text_embed(
         self,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
     ):
-        """
-        Get the text embeddings.
+        """Get the text embeddings.
+
         Args:
             tokens: a list of list of token ids.
+
         Returns:
             embed: the text embeddings, shape (batch, seq_len, emb_dim).
             tokens_lens: the length of each token sequence, shape (batch,).
         """
-        device = (
-            self.device if isinstance(self, DDP) else next(self.parameters()).device
-        )
+        device = self.device if isinstance(self, DDP) else next(self.parameters()).device
         tokens_padded = pad_labels(tokens, pad_id=self.pad_id, device=device)  # (B, S)
         embed = self.embed(tokens_padded)  # (B, S, C)
-        tokens_lens = torch.tensor(
-            [len(token) for token in tokens], dtype=torch.int64, device=device
-        )
+        tokens_lens = torch.tensor([len(token) for token in tokens], dtype=torch.int64, device=device)
         tokens_padding_mask = make_pad_mask(tokens_lens, embed.shape[1])  # (B, S)
 
-        embed = self.text_encoder(
-            x=embed, t=None, padding_mask=tokens_padding_mask
-        )  # (B, S, C)
+        embed = self.text_encoder(x=embed, t=None, padding_mask=tokens_padding_mask)  # (B, S, C)
         return embed, tokens_lens
 
     def forward_text_condition(
@@ -217,51 +218,53 @@ class ZipVoice(nn.Module):
         tokens_lens: torch.Tensor,
         features_lens: torch.Tensor,
     ):
-        """
-        Get the text condition with the same length of the acoustic feature.
+        """Get the text condition with the same length of the acoustic feature.
+
         Args:
             embed: the text embeddings, shape (batch, token_seq_len, emb_dim).
             tokens_lens: the length of each token sequence, shape (batch,).
             features_lens: the length of each acoustic feature sequence,
                 shape (batch,).
+
         Returns:
             text_condition: the text condition, shape
                 (batch, feature_seq_len, emb_dim).
             padding_mask: the padding mask of text condition, shape
                 (batch, feature_seq_len).
         """
-
         num_frames = int(features_lens.max())
 
         padding_mask = make_pad_mask(features_lens, max_len=num_frames)  # (B, T)
 
         tokens_durations = prepare_avg_tokens_durations(features_lens, tokens_lens)
 
-        tokens_index = get_tokens_index(tokens_durations, num_frames).to(
-            embed.device
-        )  # (B, T)
+        tokens_index = get_tokens_index(tokens_durations, num_frames).to(embed.device)  # (B, T)
 
         text_condition = torch.gather(
             embed,
             dim=1,
-            index=tokens_index.unsqueeze(-1).expand(
-                embed.size(0), num_frames, embed.size(-1)
-            ),
+            index=tokens_index.unsqueeze(-1).expand(embed.size(0), num_frames, embed.size(-1)),
         )  # (B, T, F)
         return text_condition, padding_mask
 
     def forward_text_train(
         self,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
         features_lens: torch.Tensor,
     ):
-        """
-        Process text for training, given text tokens and real feature lengths.
+        """Compute text conditioning tensors for training.
+
+        Args:
+            tokens: Text token ID sequences, one list per batch item.
+            features_lens: Ground-truth acoustic feature lengths, shape (B,).
+
+        Returns:
+            A tuple ``(text_condition, padding_mask)`` where
+            ``text_condition`` has shape (B, T, feat_dim) and
+            ``padding_mask`` has shape (B, T) with ``True`` at padded frames.
         """
         embed, tokens_lens = self.forward_text_embed(tokens)
-        text_condition, padding_mask = self.forward_text_condition(
-            embed, tokens_lens, features_lens
-        )
+        text_condition, padding_mask = self.forward_text_condition(embed, tokens_lens, features_lens)
         return (
             text_condition,
             padding_mask,
@@ -269,42 +272,60 @@ class ZipVoice(nn.Module):
 
     def forward_text_inference_gt_duration(
         self,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
         features_lens: torch.Tensor,
-        prompt_tokens: List[List[int]],
+        prompt_tokens: list[list[int]],
         prompt_features_lens: torch.Tensor,
     ):
+        """Compute text conditioning for inference using ground-truth feature lengths.
+
+        Prepends prompt tokens to each text token sequence and computes
+        conditioning aligned to the combined (prompt + target) frame length.
+
+        Args:
+            tokens: Target text token ID sequences, one list per batch item.
+            features_lens: Ground-truth target feature lengths, shape (B,).
+            prompt_tokens: Prompt transcription token ID sequences.
+            prompt_features_lens: Prompt feature lengths, shape (B,).
+
+        Returns:
+            A tuple ``(text_condition, padding_mask)`` aligned to the combined
+            feature length, where ``text_condition`` has shape (B, T, feat_dim)
+            and ``padding_mask`` has shape (B, T).
         """
-        Process text for inference, given text tokens, real feature lengths and prompts.
-        """
-        tokens = [
-            prompt_token + token for prompt_token, token in zip(prompt_tokens, tokens)
-        ]
+        tokens = [prompt_token + token for prompt_token, token in zip(prompt_tokens, tokens, strict=False)]
         features_lens = prompt_features_lens + features_lens
         embed, tokens_lens = self.forward_text_embed(tokens)
-        text_condition, padding_mask = self.forward_text_condition(
-            embed, tokens_lens, features_lens
-        )
+        text_condition, padding_mask = self.forward_text_condition(embed, tokens_lens, features_lens)
         return text_condition, padding_mask
 
     def forward_text_inference_ratio_duration(
         self,
-        tokens: List[List[int]],
-        prompt_tokens: List[List[int]],
+        tokens: list[list[int]],
+        prompt_tokens: list[list[int]],
         prompt_features_lens: torch.Tensor,
         speed: float,
     ):
-        """
-        Process text for inference, given text tokens and prompts,
-        feature lengths are predicted with the ratio of token numbers.
-        """
-        device = (
-            self.device if isinstance(self, DDP) else next(self.parameters()).device
-        )
+        """Compute text conditioning for inference with duration predicted from token ratio.
 
-        cat_tokens = [
-            prompt_token + token for prompt_token, token in zip(prompt_tokens, tokens)
-        ]
+        Target feature length is estimated as ``prompt_frames * (target_tokens
+        / prompt_tokens) / speed``, removing the need for a separate duration
+        model.
+
+        Args:
+            tokens: Target text token ID sequences, one list per batch item.
+            prompt_tokens: Prompt transcription token ID sequences.
+            prompt_features_lens: Prompt feature lengths, shape (B,).
+            speed: Speaking rate multiplier; values >1 produce faster speech.
+
+        Returns:
+            A tuple ``(text_condition, padding_mask)`` aligned to the predicted
+            combined feature length, where ``text_condition`` has shape
+            (B, T, feat_dim) and ``padding_mask`` has shape (B, T).
+        """
+        device = self.device if isinstance(self, DDP) else next(self.parameters()).device
+
+        cat_tokens = [prompt_token + token for prompt_token, token in zip(prompt_tokens, tokens, strict=False)]
 
         prompt_tokens_lens = torch.tensor(
             [len(token) for token in prompt_tokens],
@@ -321,17 +342,15 @@ class ZipVoice(nn.Module):
         cat_embed, cat_tokens_lens = self.forward_text_embed(cat_tokens)
 
         features_lens = prompt_features_lens + torch.ceil(
-            (prompt_features_lens / prompt_tokens_lens * tokens_lens / speed)
+            prompt_features_lens / prompt_tokens_lens * tokens_lens / speed
         ).to(dtype=torch.int64)
 
-        text_condition, padding_mask = self.forward_text_condition(
-            cat_embed, cat_tokens_lens, features_lens
-        )
+        text_condition, padding_mask = self.forward_text_condition(cat_embed, cat_tokens_lens, features_lens)
         return text_condition, padding_mask
 
-    def forward(
+    def forward(  # noqa: PLR0913
         self,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
         features: torch.Tensor,
         features_lens: torch.Tensor,
         noise: torch.Tensor,
@@ -339,6 +358,7 @@ class ZipVoice(nn.Module):
         condition_drop_ratio: float = 0.0,
     ) -> torch.Tensor:
         """Forward pass of the model for training.
+
         Args:
             tokens: a list of list of token ids.
             features: the acoustic features, with the shape (batch, seq_len, feat_dim).
@@ -346,11 +366,14 @@ class ZipVoice(nn.Module):
             noise: the intitial noise, with the shape (batch, seq_len, feat_dim).
             t: the time step, with the shape (batch, 1, 1).
             condition_drop_ratio: the ratio of dropped text condition.
+
         Returns:
             fm_loss: the flow-matching loss.
         """
-
-        (text_condition, padding_mask,) = self.forward_text_train(
+        (
+            text_condition,
+            padding_mask,
+        ) = self.forward_text_train(
             tokens=tokens,
             features_lens=features_lens,
         )
@@ -363,10 +386,7 @@ class ZipVoice(nn.Module):
         speech_condition = torch.where(speech_condition_mask.unsqueeze(-1), 0, features)
 
         if condition_drop_ratio > 0.0:
-            drop_mask = (
-                torch.rand(text_condition.size(0), 1, 1).to(text_condition.device)
-                > condition_drop_ratio
-            )
+            drop_mask = torch.rand(text_condition.size(0), 1, 1).to(text_condition.device) > condition_drop_ratio
             text_condition = text_condition * drop_mask
 
         xt = features * t + noise * (1 - t)
@@ -385,38 +405,48 @@ class ZipVoice(nn.Module):
 
         return fm_loss
 
-    def sample(
+    def sample(  # noqa: PLR0913
         self,
-        tokens: List[List[int]],
-        prompt_tokens: List[List[int]],
+        tokens: list[list[int]],
+        prompt_tokens: list[list[int]],
         prompt_features: torch.Tensor,
         prompt_features_lens: torch.Tensor,
-        features_lens: Optional[torch.Tensor] = None,
+        features_lens: torch.Tensor | None = None,
         speed: float = 1.0,
         t_shift: float = 1.0,
         duration: str = "predict",
         num_step: int = 5,
         guidance_scale: float = 0.5,
     ) -> torch.Tensor:
-        """
-        Generate acoustic features, given text tokens, prompts feature
-            and prompt transcription's text tokens.
-        Args:
-            tokens: a list of list of text tokens.
-            prompt_tokens: a list of list of prompt tokens.
-            prompt_features: the prompt feature with the shape
-                (batch_size, seq_len, feat_dim).
-            prompt_features_lens: the length of each prompt feature,
-                with the shape (batch_size,).
-            features_lens: the length of the predicted eature, with the
-                shape (batch_size,). It is used only when duration is "real".
-            duration: "real" or "predict". If "real", the predicted
-                feature length is given by features_lens.
-            num_step: the number of steps to use in the ODE solver.
-            guidance_scale: the guidance scale for classifier-free guidance.
-        """
+        """Generate acoustic features from text tokens and a voice prompt.
 
-        assert duration in ["real", "predict"]
+        Args:
+            tokens: Target text token ID sequences, one list per batch item.
+            prompt_tokens: Prompt transcription token ID sequences.
+            prompt_features: Prompt log-mel features of shape (B, T, feat_dim).
+            prompt_features_lens: Prompt feature lengths, shape (B,).
+            features_lens: Ground-truth target feature lengths, shape (B,).
+                Used only when ``duration="real"``.
+            speed: Speaking rate multiplier used when ``duration="predict"``.
+            t_shift: Time-shift parameter for the ODE solver schedule.
+            duration: Duration mode — ``"predict"`` estimates length from
+                token-count ratio; ``"real"`` uses ``features_lens`` directly.
+            num_step: Number of ODE solver steps.
+            guidance_scale: Classifier-free guidance scale.
+
+        Returns:
+            A tuple ``(x1_wo_prompt, x1_wo_prompt_lens, x1_prompt,
+            prompt_features_lens)`` where ``x1_wo_prompt`` contains the
+            generated (non-prompt) frames of shape (B, T_gen, feat_dim) and
+            ``x1_wo_prompt_lens`` holds their lengths.
+
+        Raises:
+            ValueError: If ``duration`` is not ``"real"`` or ``"predict"``, or
+                if ``duration="real"`` but ``features_lens`` is ``None``.
+        """
+        if duration not in ["real", "predict"]:
+            msg = f"duration must be 'real' or 'predict', got {duration!r}"
+            raise ValueError(msg)
 
         if duration == "predict":
             (
@@ -429,7 +459,9 @@ class ZipVoice(nn.Module):
                 speed=speed,
             )
         else:
-            assert features_lens is not None
+            if features_lens is None:
+                msg = "features_lens must be provided when duration='real'"
+                raise ValueError(msg)
             text_condition, padding_mask = self.forward_text_inference_gt_duration(
                 tokens=tokens,
                 features_lens=features_lens,
@@ -467,27 +499,20 @@ class ZipVoice(nn.Module):
             t_shift=t_shift,
         )
         x1_wo_prompt_lens = (~padding_mask).sum(-1) - prompt_features_lens
-        x1_prompt = torch.zeros(
-            x1.size(0), prompt_features_lens.max(), x1.size(2), device=x1.device
-        )
-        x1_wo_prompt = torch.zeros(
-            x1.size(0), x1_wo_prompt_lens.max(), x1.size(2), device=x1.device
-        )
+        x1_prompt = torch.zeros(x1.size(0), prompt_features_lens.max(), x1.size(2), device=x1.device)
+        x1_wo_prompt = torch.zeros(x1.size(0), x1_wo_prompt_lens.max(), x1.size(2), device=x1.device)
         for i in range(x1.size(0)):
             x1_wo_prompt[i, : x1_wo_prompt_lens[i], :] = x1[
                 i,
-                prompt_features_lens[i] : prompt_features_lens[i]
-                + x1_wo_prompt_lens[i],
+                prompt_features_lens[i] : prompt_features_lens[i] + x1_wo_prompt_lens[i],
             ]
-            x1_prompt[i, : prompt_features_lens[i], :] = x1[
-                i, : prompt_features_lens[i]
-            ]
+            x1_prompt[i, : prompt_features_lens[i], :] = x1[i, : prompt_features_lens[i]]
 
         return x1_wo_prompt, x1_wo_prompt_lens, x1_prompt, prompt_features_lens
 
-    def sample_intermediate(
+    def sample_intermediate(  # noqa: PLR0913
         self,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
         features: torch.Tensor,
         features_lens: torch.Tensor,
         noise: torch.Tensor,
@@ -497,23 +522,30 @@ class ZipVoice(nn.Module):
         num_step: int = 1,
         guidance_scale: torch.Tensor = None,
     ) -> torch.Tensor:
-        """
-        Generate acoustic features in intermediate timesteps.
+        """Generate acoustic features over an intermediate ODE time interval.
+
         Args:
-            tokens: List of list of token ids.
-            features: The acoustic features, with the shape (batch, seq_len, feat_dim).
-            features_lens: The length of each acoustic feature sequence,
-                with the shape (batch,).
-            noise: The initial noise, with the shape (batch, seq_len, feat_dim).
-            speech_condition_mask: The mask for speech condition, True means
-                non-condition positions, with the shape (batch, seq_len).
-            t_start: The start timestep.
-            t_end: The end timestep.
-            num_step: The number of steps for sampling.
-            guidance_scale: The scale for classifier-free guidance inference,
-                with the shape (batch, 1, 1).
+            tokens: Text token ID sequences, one list per batch item.
+            features: Acoustic features of shape (B, T, feat_dim).
+            features_lens: Length of each feature sequence, shape (B,).
+            noise: Initial noise tensor of shape (B, T, feat_dim).
+            speech_condition_mask: Boolean mask of shape (B, T); ``True``
+                positions are non-condition (to be generated).
+            t_start: ODE integration start timestep in [0, 1].
+            t_end: ODE integration end timestep in [0, 1].
+            num_step: Number of solver steps within ``[t_start, t_end]``.
+            guidance_scale: Classifier-free guidance scale of shape (B, 1, 1),
+                or ``None`` to disable guidance.
+
+        Returns:
+            A tuple ``(x_t_end, x_t_end_lens)`` where ``x_t_end`` has shape
+            (B, T, feat_dim) and ``x_t_end_lens`` is the unpadded length of
+            each sequence, shape (B,).
         """
-        (text_condition, padding_mask,) = self.forward_text_train(
+        (
+            text_condition,
+            padding_mask,
+        ) = self.forward_text_train(
             tokens=tokens,
             features_lens=features_lens,
         )
@@ -532,3 +564,6 @@ class ZipVoice(nn.Module):
         )
         x_t_end_lens = (~padding_mask).sum(-1)
         return x_t_end, x_t_end_lens
+
+
+# end zipvoice/models/zipvoice.py

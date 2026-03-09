@@ -1,3 +1,6 @@
+"""Euler ODE solvers for flow-matching inference, with classifier-free guidance."""
+
+# start zipvoice/models/modules/solver.py
 #!/usr/bin/env python3
 # Copyright         2024  Xiaomi Corp.        (authors: Han Zhu)
 #
@@ -15,13 +18,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional, Union
+import torch  # noqa: E402
 
-import torch
+GUIDANCE_SCALE_THRESHOLD = 0.5
 
 
 class DiffusionModel(torch.nn.Module):
     """A wrapper of diffusion models for inference.
+
     Args:
         model: The diffusion model.
         func_name: The function name to call.
@@ -32,23 +36,29 @@ class DiffusionModel(torch.nn.Module):
         model: torch.nn.Module,
         func_name: str = "forward_fm_decoder",
     ):
+        """Initialize DiffusionModel wrapper.
+
+        Args:
+            model: The diffusion model.
+            func_name: The function name to call.
+        """
         super().__init__()
         self.model = model
         self.func_name = func_name
         self.model_func = getattr(self.model, func_name)
 
-    def forward(
+    def forward(  # noqa: PLR0913
         self,
         t: torch.Tensor,
         x: torch.Tensor,
         text_condition: torch.Tensor,
         speech_condition: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        guidance_scale: Union[float, torch.Tensor] = 0.0,
-        **kwargs
+        padding_mask: torch.Tensor | None = None,
+        guidance_scale: float | torch.Tensor = 0.0,
+        **kwargs,
     ) -> torch.Tensor:
-        """
-        Forward function that Handles the classifier-free guidance.
+        """Handle classifier-free guidance and call the diffusion model.
+
         Args:
             t: The current timestep, a tensor of a tensor of a single float.
             x: The initial value, with the shape (batch, seq_len, emb_dim).
@@ -60,13 +70,13 @@ class DiffusionModel(torch.nn.Module):
                 shape (batch, seq_len).
             guidance_scale: The scale of classifier-free guidance, a float or a tensor
                 of shape (batch, 1, 1).
-        Retrun:
+            **kwargs: Additional keyword arguments passed to the model function.
+
+        Return:
             The prediction with the shape (batch, seq_len, emb_dim).
         """
         if not torch.is_tensor(guidance_scale):
-            guidance_scale = torch.tensor(
-                guidance_scale, dtype=t.dtype, device=t.device
-            )
+            guidance_scale = torch.tensor(guidance_scale, dtype=t.dtype, device=t.device)
 
         if (guidance_scale == 0.0).all():
             return self.model_func(
@@ -75,27 +85,23 @@ class DiffusionModel(torch.nn.Module):
                 text_condition=text_condition,
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
-                **kwargs
+                **kwargs,
             )
         else:
-            assert t.dim() == 0
+            if t.dim() != 0:
+                msg = f"t must be a scalar (0-dim tensor), got {t.dim()} dimensions"
+                raise ValueError(msg)
 
             x = torch.cat([x] * 2, dim=0)
             padding_mask = torch.cat([padding_mask] * 2, dim=0)
 
-            text_condition = torch.cat(
-                [torch.zeros_like(text_condition), text_condition], dim=0
-            )
+            text_condition = torch.cat([torch.zeros_like(text_condition), text_condition], dim=0)
 
-            if t > 0.5:
-                speech_condition = torch.cat(
-                    [torch.zeros_like(speech_condition), speech_condition], dim=0
-                )
+            if t > GUIDANCE_SCALE_THRESHOLD:
+                speech_condition = torch.cat([torch.zeros_like(speech_condition), speech_condition], dim=0)
             else:
                 guidance_scale = guidance_scale * 2
-                speech_condition = torch.cat(
-                    [speech_condition, speech_condition], dim=0
-                )
+                speech_condition = torch.cat([speech_condition, speech_condition], dim=0)
 
             data_uncond, data_cond = self.model_func(
                 t=t,
@@ -103,7 +109,7 @@ class DiffusionModel(torch.nn.Module):
                 text_condition=text_condition,
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
-                **kwargs
+                **kwargs,
             ).chunk(2, dim=0)
 
             res = (1 + guidance_scale) * data_cond - guidance_scale * data_uncond
@@ -112,6 +118,7 @@ class DiffusionModel(torch.nn.Module):
 
 class DistillDiffusionModel(DiffusionModel):
     """A wrapper of distilled diffusion models for inference.
+
     Args:
         model: The distilled diffusion model.
         func_name: The function name to call.
@@ -122,20 +129,26 @@ class DistillDiffusionModel(DiffusionModel):
         model: torch.nn.Module,
         func_name: str = "forward_fm_decoder",
     ):
+        """Initialize DistillDiffusionModel.
+
+        Args:
+            model: The distilled diffusion model.
+            func_name: The function name to call.
+        """
         super().__init__(model=model, func_name=func_name)
 
-    def forward(
+    def forward(  # noqa: PLR0913
         self,
         t: torch.Tensor,
         x: torch.Tensor,
         text_condition: torch.Tensor,
         speech_condition: torch.Tensor,
-        padding_mask: Optional[torch.Tensor] = None,
-        guidance_scale: Union[float, torch.Tensor] = 0.0,
-        **kwargs
+        padding_mask: torch.Tensor | None = None,
+        guidance_scale: float | torch.Tensor = 0.0,
+        **kwargs,
     ) -> torch.Tensor:
-        """
-        Forward function that Handles the classifier-free guidance.
+        """Handle classifier-free guidance for the distilled diffusion model.
+
         Args:
             t: The current timestep, a tensor of a single float.
             x: The initial value, with the shape (batch, seq_len, emb_dim).
@@ -147,13 +160,13 @@ class DistillDiffusionModel(DiffusionModel):
                 shape (batch, seq_len).
             guidance_scale: The scale of classifier-free guidance, a float or a tensor
                 of shape (batch, 1, 1).
-        Retrun:
+            **kwargs: Additional keyword arguments passed to the model function.
+
+        Return:
             The prediction with the shape (batch, seq_len, emb_dim).
         """
         if not torch.is_tensor(guidance_scale):
-            guidance_scale = torch.tensor(
-                guidance_scale, dtype=t.dtype, device=t.device
-            )
+            guidance_scale = torch.tensor(guidance_scale, dtype=t.dtype, device=t.device)
         return self.model_func(
             t=t,
             xt=x,
@@ -161,38 +174,60 @@ class DistillDiffusionModel(DiffusionModel):
             speech_condition=speech_condition,
             padding_mask=padding_mask,
             guidance_scale=guidance_scale,
-            **kwargs
+            **kwargs,
         )
 
 
 class EulerSolver:
+    """Euler ODE solver for flow-matching inference."""
+
     def __init__(
         self,
         model: torch.nn.Module,
         func_name: str = "forward_fm_decoder",
     ):
-        """Construct a Euler Solver
+        """Construct an Euler Solver.
+
         Args:
             model: The diffusion model.
             func_name: The function name to call.
         """
         self.model = DiffusionModel(model, func_name=func_name)
 
-    def sample(
+    def sample(  # noqa: PLR0913
         self,
         x: torch.Tensor,
         text_condition: torch.Tensor,
         speech_condition: torch.Tensor,
         padding_mask: torch.Tensor,
         num_step: int = 10,
-        guidance_scale: Union[float, torch.Tensor] = 0.0,
+        guidance_scale: float | torch.Tensor = 0.0,
         t_start: float = 0.0,
         t_end: float = 1.0,
         t_shift: float = 1.0,
-        **kwargs
+        **kwargs,
     ) -> torch.Tensor:
+        """Run the Euler ODE solver for flow-matching sampling.
+
+        Args:
+            x: Initial noise tensor of shape (batch, seq_len, emb_dim).
+            text_condition: Text conditioning tensor.
+            speech_condition: Speech conditioning tensor.
+            padding_mask: Padding mask tensor.
+            num_step: Number of ODE steps.
+            guidance_scale: Classifier-free guidance scale.
+            t_start: Start timestep.
+            t_end: End timestep.
+            t_shift: Time-shift parameter.
+            **kwargs: Additional keyword arguments.
+
+        Returns:
+            Generated tensor of shape (batch, seq_len, emb_dim).
+        """
         device = x.device
-        assert isinstance(t_start, float) and isinstance(t_end, float)
+        if not (isinstance(t_start, float) and isinstance(t_end, float)):
+            msg = f"t_start and t_end must be floats, got {type(t_start).__name__} and {type(t_end).__name__}"
+            raise TypeError(msg)
 
         # Generate the schedule of timesteps
         timesteps = get_time_steps(
@@ -215,7 +250,7 @@ class EulerSolver:
                 speech_condition=speech_condition,
                 padding_mask=padding_mask,
                 guidance_scale=guidance_scale,
-                **kwargs
+                **kwargs,
             )
 
             # 1. Predict the clean 'data' (x_1) and 'noise' (x_0)
@@ -224,27 +259,28 @@ class EulerSolver:
             x_1_pred = x + (1.0 - t_cur) * v
             x_0_pred = x - t_cur * v
 
-            if step < num_step - 1:
-                # 2. Probability Flow ODE update (Anchor-based)
-                # This 'anchors' the next point along the predicted line, 
-                # making it more robust than simple Euler integration.
-                x = (1.0 - t_next) * x_0_pred + t_next * x_1_pred
-            else:
-                # Final step: Snap directly to the predicted clean data
-                x = x_1_pred
+            # 2. Probability Flow ODE update (Anchor-based)
+            # This 'anchors' the next point along the predicted line,
+            # making it more robust than simple Euler integration.
+            # Final step: Snap directly to the predicted clean data
+            x = (1.0 - t_next) * x_0_pred + t_next * x_1_pred if step < num_step - 1 else x_1_pred
 
         return x
 
 
 class DistillEulerSolver(EulerSolver):
+    """Euler ODE solver for distilled flow-matching models."""
+
     def __init__(
         self,
         model: torch.nn.Module,
         func_name: str = "forward_fm_decoder",
     ):
-        """Construct a Euler Solver for distilled diffusion models.
+        """Construct an Euler Solver for distilled diffusion models.
+
         Args:
             model: The diffusion model.
+            func_name: The function name to call.
         """
         self.model = DistillDiffusionModel(model, func_name=func_name)
 
@@ -254,7 +290,7 @@ def get_time_steps(
     t_end: float = 1.0,
     num_step: int = 10,
     t_shift: float = 1.0,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device = torch.device("cpu"),  # noqa: B008
 ) -> torch.Tensor:
     """Compute the intermediate time steps for sampling.
 
@@ -266,12 +302,15 @@ def get_time_steps(
             will emphasize low SNR region. Should be in the range of (0, 1].
             The shifting will be more significant when the number is smaller.
         device: A torch device.
+
     Returns:
         The time step with the shape (num_step + 1,).
     """
-
     timesteps = torch.linspace(t_start, t_end, num_step + 1).to(device)
 
     timesteps = t_shift * timesteps / (1 + (t_shift - 1) * timesteps)
 
     return timesteps
+
+
+# end zipvoice/models/modules/solver.py

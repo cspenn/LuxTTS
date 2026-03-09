@@ -1,3 +1,6 @@
+# start zipvoice/utils/checkpoint.py
+"""Utilities for saving, loading, and managing model training checkpoints."""
+
 # Copyright  2021-2025  Xiaomi Corporation  (authors: Fangjun Kuang,
 #                                                     Zengwei Yao)
 #
@@ -16,12 +19,12 @@
 # limitations under the License.
 
 import glob
-import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
+import structlog
 import torch
 import torch.nn as nn
 from lhotse.dataset.sampling.base import CutSampler
@@ -30,21 +33,23 @@ from torch.optim import Optimizer
 
 from zipvoice.utils.common import AttributeDict, GradScaler
 
+log = structlog.get_logger()
+
 # use duck typing for LRScheduler since we have different possibilities, see
 # our class LRScheduler.
 LRSchedulerType = object
 
 
-def save_checkpoint(
+def save_checkpoint(  # noqa: PLR0913
     filename: Path,
-    model: Union[nn.Module, DDP],
-    model_avg: Optional[nn.Module] = None,
-    model_ema: Optional[nn.Module] = None,
-    params: Optional[Dict[str, Any]] = None,
-    optimizer: Optional[Optimizer] = None,
-    scheduler: Optional[LRSchedulerType] = None,
-    scaler: Optional[GradScaler] = None,
-    sampler: Optional[CutSampler] = None,
+    model: nn.Module | DDP,
+    model_avg: nn.Module | None = None,
+    model_ema: nn.Module | None = None,
+    params: dict[str, Any] | None = None,
+    optimizer: Optimizer | None = None,
+    scheduler: LRSchedulerType | None = None,
+    scaler: GradScaler | None = None,
+    sampler: CutSampler | None = None,
     rank: int = 0,
 ) -> None:
     """Save training information to a file.
@@ -64,7 +69,7 @@ def save_checkpoint(
         The optimizer to be saved. We only save its `state_dict()`.
       scheduler:
         The scheduler to be saved. We only save its `state_dict()`.
-      scalar:
+      scaler:
         The GradScaler to be saved. We only save its `state_dict()`.
       sampler:
         The sampler used in the labeled training dataset. We only
@@ -72,13 +77,14 @@ def save_checkpoint(
       rank:
         Used in DDP. We save checkpoint only for the node whose
           rank is 0.
+
     Returns:
       Return None.
     """
     if rank != 0:
         return
 
-    logging.info(f"Saving checkpoint to {filename}")
+    log.info("saving_checkpoint", filename=str(filename))
 
     if isinstance(model, DDP):
         model = model.module
@@ -98,7 +104,9 @@ def save_checkpoint(
 
     if params:
         for k, v in params.items():
-            assert k not in checkpoint
+            if k in checkpoint:
+                msg = f"Parameter key {k!r} conflicts with an existing checkpoint key."
+                raise ValueError(msg)
             checkpoint[k] = v
 
     torch.save(checkpoint, filename)
@@ -106,38 +114,51 @@ def save_checkpoint(
 
 def load_checkpoint(
     filename: Path,
-    model: Optional[nn.Module] = None,
-    model_avg: Optional[nn.Module] = None,
-    model_ema: Optional[nn.Module] = None,
+    model: nn.Module | None = None,
+    model_avg: nn.Module | None = None,
+    model_ema: nn.Module | None = None,
     strict: bool = False,
-) -> Dict[str, Any]:
-    logging.info(f"Loading checkpoint from {filename}")
+) -> dict[str, Any]:
+    """Load a checkpoint and restore model state dicts.
+
+    Args:
+        filename: Path to the checkpoint file.
+        model: The model to restore (optional).
+        model_avg: The averaged model to restore (optional).
+        model_ema: The EMA model to restore (optional).
+        strict: Whether to require exact key matching.
+
+    Returns:
+        The remaining checkpoint dict after removing loaded model state dicts.
+    """
+    log.info("loading_checkpoint", filename=str(filename))
     checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
 
     if model is not None:
-
         if next(iter(checkpoint["model"])).startswith("module."):
-            logging.debug("Loading checkpoint saved by DDP")
+            log.debug("loading_checkpoint_saved_by_ddp")
             dst_state_dict = model.state_dict()
             src_state_dict = checkpoint["model"]
-            for key in dst_state_dict.keys():
+            for key in dst_state_dict:
                 src_key = "{}.{}".format("module", key)
                 dst_state_dict[key] = src_state_dict.pop(src_key)
-            assert len(src_state_dict) == 0
+            if len(src_state_dict) != 0:
+                msg = f"Unexpected keys remain in DDP checkpoint: {list(src_state_dict.keys())}"
+                raise RuntimeError(msg)
             model.load_state_dict(dst_state_dict, strict=strict)
         else:
-            logging.debug("Loading checkpoint")
+            log.debug("loading_checkpoint")
             model.load_state_dict(checkpoint["model"], strict=strict)
 
         checkpoint.pop("model")
 
     if model_avg is not None and "model_avg" in checkpoint:
-        logging.info("Loading averaged model")
+        log.info("loading_averaged_model")
         model_avg.load_state_dict(checkpoint["model_avg"], strict=strict)
         checkpoint.pop("model_avg")
 
     if model_ema is not None and "model_ema" in checkpoint:
-        logging.info("Loading ema model")
+        log.info("loading_ema_model")
         model_ema.load_state_dict(checkpoint["model_ema"], strict=strict)
         checkpoint.pop("model_ema")
 
@@ -146,21 +167,34 @@ def load_checkpoint(
 
 def load_checkpoint_extend_vocab_size(
     filename: Path, extend_size: int, model: nn.Module, strict: bool = True
-) -> Dict[str, Any]:
-    logging.info(f"Loading checkpoint from {filename}")
+) -> dict[str, Any]:
+    """Load checkpoint and extend vocabulary embedding weights.
+
+    Args:
+        filename: Path to the checkpoint file.
+        extend_size: Number of new vocabulary entries to extend by.
+        model: The model whose vocabulary should be extended.
+        strict: Whether to require exact key matching.
+
+    Returns:
+        The checkpoint dict.
+    """
+    log.info("loading_checkpoint", filename=str(filename))
     checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
 
     if model is not None:
         if next(iter(checkpoint["model"])).startswith("module."):
-            logging.info("Loading checkpoint saved by DDP")
+            log.info("loading_checkpoint_saved_by_ddp")
             dst_state_dict = model.state_dict()
             src_state_dict = checkpoint["model"]
-            for key in dst_state_dict.keys():
+            for key in dst_state_dict:
                 src_key = "{}.{}".format("module", key)
                 dst_state_dict[key] = src_state_dict.pop(src_key)
-            assert len(src_state_dict) == 0
+            if len(src_state_dict) != 0:
+                msg = f"Unexpected keys remain in DDP checkpoint: {list(src_state_dict.keys())}"
+                raise RuntimeError(msg)
         else:
-            logging.info("Loading checkpoint")
+            log.info("loading_checkpoint")
             dst_state_dict = checkpoint["model"]
         dst_state_dict["spk_embed.weight"] = model.state_dict()["spk_embed.weight"]
         embed_weight = model.state_dict()["embed.weight"]
@@ -170,66 +204,86 @@ def load_checkpoint_extend_vocab_size(
         model.load_state_dict(dst_state_dict, strict=strict)
 
 
+def _remap_in_proj_key(dst_state_dict: dict, key: str, dim: int) -> None:
+    """Remap a single in-projection key for three-channel alternation."""
+    if "weight" in key:
+        weight = dst_state_dict.pop(key)
+        dst_state_dict[key.replace("weight", "0.weight")] = torch.cat(
+            [
+                weight[:, :dim] / 2,
+                weight[:, :dim] / 2,
+                weight[:, dim : dim * 2],
+                weight[:, dim * 2 :] / 2,
+                weight[:, dim * 2 :] / 2,
+            ],
+            dim=-1,
+        )
+        dst_state_dict[key.replace("weight", "1.weight")] = weight
+    if "bias" in key:
+        bias = dst_state_dict.pop(key)
+        dst_state_dict[key.replace("bias", "0.bias")] = bias
+        dst_state_dict[key.replace("bias", "1.bias")] = bias
+
+
+def _remap_out_proj_key(dst_state_dict: dict, key: str) -> None:
+    """Remap a single out-projection key for three-channel alternation."""
+    if "weight" in key:
+        weight = dst_state_dict.pop(key)
+        dst_state_dict[key.replace("weight", "0.weight")] = torch.cat([weight, weight], dim=0)
+        dst_state_dict[key.replace("weight", "1.weight")] = weight
+    elif "bias" in key:
+        bias = dst_state_dict.pop(key)
+        dst_state_dict[key.replace("bias", "0.bias")] = torch.cat([bias, bias], dim=0)
+        dst_state_dict[key.replace("bias", "1.bias")] = bias
+
+
 def load_checkpoint_copy_proj_three_channel_alter(
     filename: Path,
     in_proj_key: str,
     out_proj_key: str,
     dim: int,
     model: nn.Module,
-) -> Dict[str, Any]:
-    logging.info(f"Loading checkpoint from {filename}")
+) -> dict[str, Any]:
+    """Load checkpoint remapping projection weights for three-channel alternation.
+
+    Args:
+        filename: Path to the checkpoint file.
+        in_proj_key: Key substring identifying in-projection weights.
+        out_proj_key: Key substring identifying out-projection weights.
+        dim: Projection dimension used in the remap.
+        model: The model to load the remapped state dict into.
+
+    Returns:
+        The checkpoint dict.
+    """
+    log.info("loading_checkpoint", filename=str(filename))
     checkpoint = torch.load(filename, map_location="cpu", weights_only=False)
 
     if model is not None:
         if next(iter(checkpoint["model"])).startswith("module."):
-            logging.info("Loading checkpoint saved by DDP")
+            log.info("loading_checkpoint_saved_by_ddp")
 
             dst_state_dict = dict()
             src_state_dict = checkpoint["model"]
-            for key in src_state_dict.keys():
+            for key in src_state_dict:
                 dst_state_dict[key.lstrip("module.")] = src_state_dict.pop(key)
-            assert len(src_state_dict) == 0
+            if len(src_state_dict) != 0:
+                msg = f"Unexpected keys remain in DDP checkpoint: {list(src_state_dict.keys())}"
+                raise RuntimeError(msg)
         else:
-            logging.info("Loading checkpoint")
+            log.info("loading_checkpoint")
             dst_state_dict = checkpoint["model"]
         keys = list(dst_state_dict.keys())
         for key in keys:
             if in_proj_key in key:
-                if "weight" in key:
-                    weight = dst_state_dict.pop(key)
-                    dst_state_dict[key.replace("weight", "0.weight")] = torch.cat(
-                        [
-                            weight[:, :dim] / 2,
-                            weight[:, :dim] / 2,
-                            weight[:, dim : dim * 2],
-                            weight[:, dim * 2 :] / 2,
-                            weight[:, dim * 2 :] / 2,
-                        ],
-                        dim=-1,
-                    )
-                    dst_state_dict[key.replace("weight", "1.weight")] = weight
-                if "bias" in key:
-                    bias = dst_state_dict.pop(key)
-                    dst_state_dict[key.replace("bias", "0.bias")] = bias
-                    dst_state_dict[key.replace("bias", "1.bias")] = bias
+                _remap_in_proj_key(dst_state_dict, key, dim)
             if out_proj_key in key:
-                if "weight" in key:
-                    weight = dst_state_dict.pop(key)
-                    dst_state_dict[key.replace("weight", "0.weight")] = torch.cat(
-                        [weight, weight], dim=0
-                    )
-                    dst_state_dict[key.replace("weight", "1.weight")] = weight
-                elif "bias" in key:
-                    bias = dst_state_dict.pop(key)
-                    dst_state_dict[key.replace("bias", "0.bias")] = torch.cat(
-                        [bias, bias], dim=0
-                    )
-                    dst_state_dict[key.replace("bias", "1.bias")] = bias
+                _remap_out_proj_key(dst_state_dict, key)
 
         model.load_state_dict(dst_state_dict, strict=True)
 
 
-def find_checkpoints(out_dir: Path, iteration: int = 0) -> List[str]:
+def find_checkpoints(out_dir: Path, iteration: int = 0) -> list[str]:
     """Find all available checkpoints in a directory.
 
     The checkpoint filenames have the form: `checkpoint-xxx.pt`
@@ -265,6 +319,7 @@ def find_checkpoints(out_dir: Path, iteration: int = 0) -> List[str]:
         greater than or equal to `iteration`.
         If it is negative, return the checkpoints whose iteration number is
         less than or equal to `-iteration`.
+
     Returns:
       Return a list of checkpoint filenames, sorted in descending
       order by the numerical value in the filename.
@@ -275,7 +330,7 @@ def find_checkpoints(out_dir: Path, iteration: int = 0) -> List[str]:
     for c in checkpoints:
         result = pattern.search(c)
         if not result:
-            logging.warn(f"Invalid checkpoint filename {c}")
+            log.warning("invalid_checkpoint_filename", filename=c)
             continue
 
         iter_checkpoints.append((int(result.group(1)), c))
@@ -295,10 +350,12 @@ def find_checkpoints(out_dir: Path, iteration: int = 0) -> List[str]:
 def average_checkpoints_with_averaged_model(
     filename_start: str,
     filename_end: str,
-    device: torch.device = torch.device("cpu"),
-) -> Dict[str, torch.Tensor]:
-    """Average model parameters over the range with given
-    start model (excluded) and end model.
+    device: torch.device | None = None,
+) -> dict[str, torch.Tensor]:
+    """Average model parameters over the range with given start model (excluded) and end model.
+
+    Original signature used ``torch.device("cpu")`` as default; now uses ``None``
+    (resolved to CPU inside the function) to avoid B008.
 
     Let start = batch_idx_train of model-start;
         end = batch_idx_train of model-end;
@@ -328,9 +385,9 @@ def average_checkpoints_with_averaged_model(
       device:
         Move checkpoints to this device before averaging.
     """
-    state_dict_start = torch.load(
-        filename_start, map_location=device, weights_only=False
-    )
+    if device is None:
+        device = torch.device("cpu")
+    state_dict_start = torch.load(filename_start, map_location=device, weights_only=False)
     state_dict_end = torch.load(filename_end, map_location=device, weights_only=False)
 
     average_period = state_dict_start["average_period"]
@@ -340,7 +397,9 @@ def average_checkpoints_with_averaged_model(
     batch_idx_train_end = state_dict_end["batch_idx_train"]
     batch_idx_train_end = (batch_idx_train_end // average_period) * average_period
     interval = batch_idx_train_end - batch_idx_train_start
-    assert interval > 0, interval
+    if interval <= 0:
+        msg = f"Expected interval > 0, got interval={interval}"
+        raise ValueError(msg)
     weight_end = batch_idx_train_end / interval
     weight_start = 1 - weight_end
 
@@ -381,13 +440,15 @@ def remove_checkpoints(
         If using DDP for training, it is the rank of the current node.
         Use 0 if no DDP is used for training.
     """
-    assert topk >= 1, topk
+    if topk < 1:
+        msg = f"topk must be >= 1, got {topk}"
+        raise ValueError(msg)
     if rank != 0:
         return
     checkpoints = find_checkpoints(out_dir)
 
     if len(checkpoints) == 0:
-        logging.warn(f"No checkpoints found in {out_dir}")
+        log.warning("no_checkpoints_found", out_dir=str(out_dir))
         return
 
     if len(checkpoints) <= topk:
@@ -402,8 +463,8 @@ def resume_checkpoint(
     params: AttributeDict,
     model: nn.Module,
     model_avg: nn.Module,
-    model_ema: Optional[nn.Module] = None,
-) -> Optional[Dict[str, Any]]:
+    model_ema: nn.Module | None = None,
+) -> dict[str, Any] | None:
     """Load checkpoint from file.
 
     If params.start_epoch is larger than 1, it will load the checkpoint from
@@ -418,12 +479,19 @@ def resume_checkpoint(
         The return value of :func:`get_params`.
       model:
         The training model.
+      model_avg:
+        The averaged model.
+      model_ema:
+        The EMA model (optional).
+
     Returns:
       Return a dict containing previously saved training info.
     """
     filename = params.exp_dir / f"epoch-{params.start_epoch - 1}.pt"
 
-    assert filename.is_file(), f"{filename} does not exist!"
+    if not filename.is_file():
+        msg = f"{filename} does not exist!"
+        raise FileNotFoundError(msg)
 
     saved_params = load_checkpoint(
         filename,
@@ -448,20 +516,20 @@ def resume_checkpoint(
 
 
 def average_state_dict(
-    state_dict_1: Dict[str, torch.Tensor],
-    state_dict_2: Dict[str, torch.Tensor],
+    state_dict_1: dict[str, torch.Tensor],
+    state_dict_2: dict[str, torch.Tensor],
     weight_1: float,
     weight_2: float,
     scaling_factor: float = 1.0,
-) -> Dict[str, torch.Tensor]:
-    """Average two state_dict with given weights:
-    state_dict_1 = (state_dict_1 * weight_1 + state_dict_2 * weight_2)
-      * scaling_factor
+) -> dict[str, torch.Tensor]:
+    """Average two state_dict with given weights.
+
+    Computes: state_dict_1 = (state_dict_1 * weight_1 + state_dict_2 * weight_2) * scaling_factor.
     It is an in-place operation on state_dict_1 itself.
     """
     # Identify shared parameters. Two parameters are said to be shared
     # if they have the same data_ptr
-    uniqued: Dict[int, str] = dict()
+    uniqued: dict[int, str] = dict()
     for k, v in state_dict_1.items():
         v_data_ptr = v.data_ptr()
         if v_data_ptr in uniqued:
@@ -478,13 +546,14 @@ def average_state_dict(
 
 
 def update_averaged_model(
-    params: Dict[str, torch.Tensor],
-    model_cur: Union[nn.Module, DDP],
+    params: dict[str, torch.Tensor],
+    model_cur: nn.Module | DDP,
     model_avg: nn.Module,
 ) -> None:
-    """Update the averaged model:
-    model_avg = model_cur * (average_period / batch_idx_train)
-      + model_avg * ((batch_idx_train - average_period) / batch_idx_train)
+    """Update the averaged model.
+
+    Computes: model_avg = model_cur * (average_period / batch_idx_train)
+      + model_avg * ((batch_idx_train - average_period) / batch_idx_train).
 
     Args:
       params:
@@ -511,16 +580,16 @@ def update_averaged_model(
     )
 
 
-def save_checkpoint_with_global_batch_idx(
+def save_checkpoint_with_global_batch_idx(  # noqa: PLR0913
     out_dir: Path,
     global_batch_idx: int,
-    model: Union[nn.Module, DDP],
-    model_avg: Optional[nn.Module] = None,
-    params: Optional[Dict[str, Any]] = None,
-    optimizer: Optional[Optimizer] = None,
-    scheduler: Optional[LRSchedulerType] = None,
-    scaler: Optional[GradScaler] = None,
-    sampler: Optional[CutSampler] = None,
+    model: nn.Module | DDP,
+    model_avg: nn.Module | None = None,
+    params: dict[str, Any] | None = None,
+    optimizer: Optimizer | None = None,
+    scheduler: LRSchedulerType | None = None,
+    scaler: GradScaler | None = None,
+    sampler: CutSampler | None = None,
     rank: int = 0,
 ):
     """Save training info after processing given number of batches.
@@ -568,3 +637,6 @@ def save_checkpoint_with_global_batch_idx(
         sampler=sampler,
         rank=rank,
     )
+
+
+# end zipvoice/utils/checkpoint.py

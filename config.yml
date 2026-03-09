@@ -1,0 +1,19 @@
+# LuxTTS configuration
+# Copy to config.local.yml and edit for local overrides.
+
+model:
+  repo_id: "YatharthS/LuxTTS"
+  device: "auto"       # auto, cuda, mps, cpu
+  threads: 4           # CPU inference thread count
+
+generation:
+  num_steps: 4
+  guidance_scale: 3.0
+  speed: 1.0
+  t_shift: 0.5
+  target_rms: 0.1
+
+audio:
+  freq_range: 12000
+  default_rms: 0.001
+  default_prompt_duration: 5

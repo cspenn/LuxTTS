@@ -1,3 +1,6 @@
+"""ZipVoiceDialog and ZipVoiceDialogStereo: dialog/stereo TTS model variants."""
+
+# start zipvoice/models/zipvoice_dialog.py
 # Copyright    2025    Xiaomi Corp.        (authors:  Han Zhu)
 #
 # See ../../../../LICENSE for clarification regarding multiple authors
@@ -14,8 +17,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
-
 import torch
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -28,11 +29,11 @@ from zipvoice.utils.common import condition_time_mask_suffix, make_pad_mask, pad
 class ZipVoiceDialog(ZipVoice):
     """The ZipVoice-Dialog model."""
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
-        fm_decoder_downsampling_factor: List[int] = [1, 2, 4, 2, 1],
-        fm_decoder_num_layers: List[int] = [2, 2, 4, 4, 4],
-        fm_decoder_cnn_module_kernel: List[int] = [31, 15, 7, 15, 31],
+        fm_decoder_downsampling_factor: list[int] = None,
+        fm_decoder_num_layers: list[int] = None,
+        fm_decoder_cnn_module_kernel: list[int] = None,
         fm_decoder_feedforward_dim: int = 1536,
         fm_decoder_num_heads: int = 4,
         fm_decoder_dim: int = 512,
@@ -53,8 +54,7 @@ class ZipVoiceDialog(ZipVoice):
         spk_a_id: int = 360,
         spk_b_id: int = 361,
     ):
-        """
-        Initialize the model with specified configuration parameters.
+        """Initialize the model with specified configuration parameters.
 
         Args:
             fm_decoder_downsampling_factor: List of downsampling factors for each layer
@@ -87,6 +87,12 @@ class ZipVoiceDialog(ZipVoice):
             spk_a_id: ID of speaker A / [S1].
             spk_b_id: ID of speaker B / [S2].
         """
+        if fm_decoder_cnn_module_kernel is None:
+            fm_decoder_cnn_module_kernel = [31, 15, 7, 15, 31]
+        if fm_decoder_num_layers is None:
+            fm_decoder_num_layers = [2, 2, 4, 4, 4]
+        if fm_decoder_downsampling_factor is None:
+            fm_decoder_downsampling_factor = [1, 2, 4, 2, 1]
         super().__init__(
             fm_decoder_downsampling_factor=fm_decoder_downsampling_factor,
             fm_decoder_num_layers=fm_decoder_num_layers,
@@ -116,6 +122,7 @@ class ZipVoiceDialog(ZipVoice):
         torch.nn.init.normal_(self.spk_embed.weight, mean=0, std=0.1)
 
     def extract_spk_indices(self, tensor):
+        """Extract speaker A and B token position indices from the padded token tensor."""
         turn_mask = ((tensor == self.spk_a_id) | (tensor == self.spk_b_id)).long()
         turn_counts = turn_mask.cumsum(dim=1)
         spk_mask = turn_counts % 2
@@ -126,41 +133,32 @@ class ZipVoiceDialog(ZipVoice):
 
     def forward_text_embed(
         self,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
     ):
-        """
-        Get the text embeddings.
+        """Get the text embeddings.
+
         Args:
             tokens: a list of list of token ids.
+
         Returns:
             embed: the text embeddings, shape (batch, seq_len, emb_dim).
             tokens_lens: the length of each token sequence, shape (batch,).
         """
-        device = (
-            self.device if isinstance(self, DDP) else next(self.parameters()).device
-        )
+        device = self.device if isinstance(self, DDP) else next(self.parameters()).device
         tokens_padded = pad_labels(tokens, pad_id=self.pad_id, device=device)  # (B, S)
         embed = self.embed(tokens_padded)  # (B, S, C)
         spk_a_indices, spk_b_indices = self.extract_spk_indices(tokens_padded)
-        tokens_lens = torch.tensor(
-            [len(token) for token in tokens], dtype=torch.int64, device=device
-        )
+        tokens_lens = torch.tensor([len(token) for token in tokens], dtype=torch.int64, device=device)
         tokens_padding_mask = make_pad_mask(tokens_lens, embed.shape[1])  # (B, S)
 
-        embed = self.text_encoder(
-            x=embed, t=None, padding_mask=tokens_padding_mask
-        )  # (B, S, C)
-        embed[spk_a_indices] += self.spk_embed(torch.tensor(0, device=device)).to(
-            embed.dtype
-        )
-        embed[spk_b_indices] += self.spk_embed(torch.tensor(1, device=device)).to(
-            embed.dtype
-        )
+        embed = self.text_encoder(x=embed, t=None, padding_mask=tokens_padding_mask)  # (B, S, C)
+        embed[spk_a_indices] += self.spk_embed(torch.tensor(0, device=device)).to(embed.dtype)
+        embed[spk_b_indices] += self.spk_embed(torch.tensor(1, device=device)).to(embed.dtype)
         return embed, tokens_lens
 
-    def forward(
+    def forward(  # noqa: PLR0913
         self,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
         features: torch.Tensor,
         features_lens: torch.Tensor,
         noise: torch.Tensor,
@@ -168,6 +166,7 @@ class ZipVoiceDialog(ZipVoice):
         condition_drop_ratio: float = 0.0,
     ) -> torch.Tensor:
         """Forward pass of the model for training.
+
         Args:
             tokens: a list of list of token ids.
             features: the acoustic features, with the shape (batch, seq_len, feat_dim).
@@ -175,11 +174,14 @@ class ZipVoiceDialog(ZipVoice):
             noise: the intitial noise, with the shape (batch, seq_len, feat_dim).
             t: the time step, with the shape (batch, 1, 1).
             condition_drop_ratio: the ratio of dropped text condition.
+
         Returns:
             fm_loss: the flow-matching loss.
         """
-
-        (text_condition, padding_mask,) = self.forward_text_train(
+        (
+            text_condition,
+            padding_mask,
+        ) = self.forward_text_train(
             tokens=tokens,
             features_lens=features_lens,
         )
@@ -192,10 +194,7 @@ class ZipVoiceDialog(ZipVoice):
         speech_condition = torch.where(speech_condition_mask.unsqueeze(-1), 0, features)
 
         if condition_drop_ratio > 0.0:
-            drop_mask = (
-                torch.rand(text_condition.size(0), 1, 1).to(text_condition.device)
-                > condition_drop_ratio
-            )
+            drop_mask = torch.rand(text_condition.size(0), 1, 1).to(text_condition.device) > condition_drop_ratio
             text_condition = text_condition * drop_mask
 
         xt = features * t + noise * (1 - t)
@@ -216,7 +215,10 @@ class ZipVoiceDialog(ZipVoice):
 
 
 class ZipVoiceDialogStereo(ZipVoiceDialog):
+    """Stereo variant of ZipVoiceDialog using the two-stream Zipformer decoder."""
+
     def __init__(self, *args, **kwargs):
+        """Initialize ZipVoiceDialogStereo, replacing the fm_decoder with TTSZipformerTwoStream."""
         super().__init__(*args, **kwargs)
 
         required_params = {
@@ -236,7 +238,8 @@ class ZipVoiceDialogStereo(ZipVoiceDialog):
 
         missing = [p for p in required_params if p not in kwargs]
         if missing:
-            raise ValueError(f"Missing required parameters: {', '.join(missing)}")
+            msg = f"Missing required parameters: {', '.join(missing)}"
+            raise ValueError(msg)
 
         self.fm_decoder = TTSZipformerTwoStream(
             in_dim=(kwargs["feat_dim"] * 5, kwargs["feat_dim"] * 3),
@@ -255,9 +258,9 @@ class ZipVoiceDialogStereo(ZipVoiceDialog):
             time_embed_dim=kwargs["time_embed_dim"],
         )
 
-    def forward(
+    def forward(  # noqa: PLR0913
         self,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
         features: torch.Tensor,
         features_lens: torch.Tensor,
         noise: torch.Tensor,
@@ -266,6 +269,7 @@ class ZipVoiceDialogStereo(ZipVoiceDialog):
         se_weight: float = 1.0,
     ) -> torch.Tensor:
         """Forward pass of the model for training.
+
         Args:
             tokens: a list of list of token ids.
             features: the acoustic features, with the shape (batch, seq_len, feat_dim).
@@ -274,11 +278,14 @@ class ZipVoiceDialogStereo(ZipVoiceDialog):
             t: the time step, with the shape (batch, 1, 1).
             condition_drop_ratio: the ratio of dropped text condition.
             se_weight: the weight of the speaker exclusive loss.
+
         Returns:
             fm_loss: the flow-matching loss.
         """
-
-        (text_condition, padding_mask,) = self.forward_text_train(
+        (
+            text_condition,
+            padding_mask,
+        ) = self.forward_text_train(
             tokens=tokens,
             features_lens=features_lens,
         )
@@ -291,10 +298,7 @@ class ZipVoiceDialogStereo(ZipVoiceDialog):
         speech_condition = torch.where(speech_condition_mask.unsqueeze(-1), 0, features)
 
         if condition_drop_ratio > 0.0:
-            drop_mask = (
-                torch.rand(text_condition.size(0), 1, 1).to(text_condition.device)
-                > condition_drop_ratio
-            )
+            drop_mask = torch.rand(text_condition.size(0), 1, 1).to(text_condition.device) > condition_drop_ratio
             text_condition = text_condition * drop_mask
 
         xt = features * t + noise * (1 - t)
@@ -315,9 +319,7 @@ class ZipVoiceDialogStereo(ZipVoiceDialog):
             target = xt + vt * (1 - t)
             fbank_1 = target[:, :, : self.feat_dim]
             fbank_2 = target[:, :, self.feat_dim :]
-            energy_loss = torch.mean(
-                self.energy_based_loss(fbank_1, fbank_2, features)[loss_mask]
-            )
+            energy_loss = torch.mean(self.energy_based_loss(fbank_1, fbank_2, features)[loss_mask])
             loss = fm_loss + energy_loss * se_weight
         else:
             loss = fm_loss
@@ -325,6 +327,7 @@ class ZipVoiceDialogStereo(ZipVoiceDialog):
         return loss
 
     def energy_based_loss(self, fbank1, fbank2, gt_fbank):
+        """Compute energy-based speaker-exclusive penalty between two fbank streams."""
         energy1 = self.energy(fbank1)
         energy2 = self.energy(fbank2)
 
@@ -338,21 +341,20 @@ class ZipVoiceDialogStereo(ZipVoiceDialog):
             )
         )
 
-        both_speaking = (
-            (energy1 > energy_thresholds) & (energy2 > energy_thresholds)
-        ).float()
+        both_speaking = ((energy1 > energy_thresholds) & (energy2 > energy_thresholds)).float()
 
-        penalty = (
-            both_speaking
-            * (energy1 - energy_thresholds)
-            * (energy2 - energy_thresholds)
-        )
+        penalty = both_speaking * (energy1 - energy_thresholds) * (energy2 - energy_thresholds)
         return penalty
 
     def energy(self, fbank):
+        """Compute mean energy across the feature dimension."""
         return torch.mean(fbank, dim=-1)
 
     def adaptive_threshold_from_gt(self, gt_fbank, percentile=50):
+        """Compute an adaptive energy threshold from ground-truth fbank at the given percentile."""
         frame_energies = self.energy(gt_fbank)
         thresholds = torch.quantile(frame_energies, q=percentile / 100, dim=1)
         return thresholds.unsqueeze(1)
+
+
+# end zipvoice/models/zipvoice_dialog.py

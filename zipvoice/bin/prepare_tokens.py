@@ -1,56 +1,19 @@
-"""
-This file reads the texts in given manifest and save the new cuts with prepared tokens.
-"""
+# start zipvoice/bin/prepare_tokens.py
+"""This file reads the texts in given manifest and save the new cuts with prepared tokens."""
 
-import argparse
-import logging
 from functools import partial
 from pathlib import Path
 
+import structlog
+import typer
 from lhotse import load_manifest, split_parallelize_combine
 
 from zipvoice.tokenizer.tokenizer import add_tokens
 
+log = structlog.get_logger()
 
-def get_args():
-    parser = argparse.ArgumentParser()
 
-    parser.add_argument(
-        "--input-file",
-        type=str,
-        help="Input manifest without tokens",
-    )
-
-    parser.add_argument(
-        "--output-file",
-        type=str,
-        help="Output manifest with tokens.",
-    )
-
-    parser.add_argument(
-        "--num-jobs",
-        type=int,
-        default=20,
-        help="Number of jobs to run in parallel.",
-    )
-
-    parser.add_argument(
-        "--tokenizer",
-        type=str,
-        default="emilia",
-        choices=["emilia", "espeak", "dialog", "libritts", "simple"],
-        help="The destination directory of manifest files.",
-    )
-
-    parser.add_argument(
-        "--lang",
-        type=str,
-        default="en-us",
-        help="Language identifier, used when tokenizer type is espeak. see"
-        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
-    )
-
-    return parser.parse_args()
+app = typer.Typer(help="Read texts from manifest and save cuts with prepared tokens.", add_completion=False)
 
 
 def prepare_tokens(
@@ -60,44 +23,66 @@ def prepare_tokens(
     tokenizer: str,
     lang: str = "en-us",
 ):
-    logging.info(f"Processing {input_file}")
+    """Prepare tokens for a manifest file by running the tokenizer.
+
+    Args:
+        input_file: Path to the input manifest file.
+        output_file: Path to save the output manifest with tokens.
+        num_jobs: Number of parallel jobs.
+        tokenizer: Tokenizer type name.
+        lang: Language identifier for espeak tokenizer.
+    """
+    log.info("processing", input_file=str(input_file))
     if output_file.is_file():
-        logging.info(f"{output_file} exists, skipping.")
+        log.info("output_exists_skipping", output_file=str(output_file))
         return
-    logging.info(f"loading manifest from {input_file}")
+    log.info("loading_manifest", input_file=str(input_file))
     cut_set = load_manifest(input_file)
 
     _add_tokens = partial(add_tokens, tokenizer=tokenizer, lang=lang)
 
-    logging.info("Adding tokens")
+    log.info("adding_tokens")
 
-    cut_set = split_parallelize_combine(
-        num_jobs=num_jobs, manifest=cut_set, fn=_add_tokens
-    )
+    cut_set = split_parallelize_combine(num_jobs=num_jobs, manifest=cut_set, fn=_add_tokens)
 
-    logging.info(f"Saving file to {output_file}")
+    log.info("saving_file", output_file=str(output_file))
     cut_set.to_file(output_file)
 
 
-if __name__ == "__main__":
-    formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
-    logging.basicConfig(format=formatter, level=logging.INFO, force=True)
-
-    args = get_args()
-    input_file = Path(args.input_file)
-    output_file = Path(args.output_file)
-    num_jobs = args.num_jobs
-    tokenizer = args.tokenizer
-    lang = args.lang
-
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+@app.command()
+def main(
+    input_file: str = typer.Option(..., "--input-file", help="Input manifest without tokens"),  # noqa: B008
+    output_file: str = typer.Option(..., "--output-file", help="Output manifest with tokens."),  # noqa: B008
+    num_jobs: int = typer.Option(20, "--num-jobs", help="Number of jobs to run in parallel."),  # noqa: B008
+    tokenizer: str = typer.Option(
+        "emilia",
+        "--tokenizer",
+        help="The destination directory of manifest files.",
+    ),
+    lang: str = typer.Option(
+        "en-us",
+        "--lang",
+        help="Language identifier, used when tokenizer type is espeak. see"
+        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
+    ),
+) -> None:
+    """Prepare token-augmented manifest files for training."""
+    input_path = Path(input_file)
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     prepare_tokens(
-        input_file=input_file,
-        output_file=output_file,
+        input_file=input_path,
+        output_file=output_path,
         num_jobs=num_jobs,
         tokenizer=tokenizer,
         lang=lang,
     )
 
-    logging.info("Done!")
+    log.info("done")
+
+
+if __name__ == "__main__":
+    app()
+
+# end zipvoice/bin/prepare_tokens.py

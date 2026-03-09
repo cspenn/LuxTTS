@@ -1,3 +1,4 @@
+# start zipvoice/bin/infer_zipvoice_onnx.py
 #!/usr/bin/env python3
 # Copyright         2025  Xiaomi Corp.        (authors: Han Zhu,
 #                                                       Zengwei Yao)
@@ -16,10 +17,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-This script generates speech with our pre-trained ZipVoice or ZipVoice-Distill
-    ONNX models. If no local model is specified,
-    Required files will be automatically downloaded from HuggingFace.
+r"""Generate speech with pre-trained ZipVoice or ZipVoice-Distill ONNX models.
+
+If no local model is specified, required files will be automatically
+downloaded from HuggingFace.
 
 Usage:
 
@@ -54,231 +55,71 @@ Set `--onnx-int8 True` to use int8 quantizated ONNX model.
 Quantizated model has faster but lower quality.
 """
 
-import argparse
 import datetime as dt
-import json
-import logging
 import os
 from pathlib import Path
-from typing import List, Tuple
 
-import numpy as np
-import onnxruntime as ort
-import torch
-import torchaudio
-from huggingface_hub import hf_hub_download
-from lhotse.utils import fix_random_seed
-from torch import Tensor, nn
+import orjson
+import structlog
+import typer
 
-from zipvoice.bin.infer_zipvoice import get_vocoder
-from zipvoice.models.modules.solver import get_time_steps
-from zipvoice.tokenizer.tokenizer import (
+log = structlog.get_logger()
+
+import numpy as np  # noqa: E402
+import onnxruntime as ort  # noqa: E402
+import torch  # noqa: E402
+import torchaudio  # noqa: E402
+from huggingface_hub import hf_hub_download  # noqa: E402
+from lhotse.utils import fix_random_seed  # noqa: E402
+from torch import Tensor, nn  # noqa: E402
+
+from zipvoice.bin.infer_zipvoice import get_vocoder  # noqa: E402
+from zipvoice.constants import HUGGINGFACE_REPO_ZIPVOICE  # noqa: E402
+from zipvoice.models.modules.solver import get_time_steps  # noqa: E402
+from zipvoice.tokenizer.tokenizer import (  # noqa: E402
     EmiliaTokenizer,
     EspeakTokenizer,
     LibriTTSTokenizer,
     SimpleTokenizer,
 )
-from zipvoice.utils.common import AttributeDict, str2bool
-from zipvoice.utils.feature import VocosFbank
-from zipvoice.utils.infer import (
+from zipvoice.utils.feature import VocosFbank  # noqa: E402
+from zipvoice.utils.infer import (  # noqa: E402
     add_punctuation,
     chunk_tokens_punctuation,
-    cross_fade_concat,
     load_prompt_wav,
+    merge_chunked_wavs,
     remove_silence,
     rms_norm,
 )
 
-HUGGINGFACE_REPO = "k2-fsa/ZipVoice"
+HUGGINGFACE_REPO = HUGGINGFACE_REPO_ZIPVOICE
 MODEL_DIR = {
     "zipvoice": "zipvoice",
     "zipvoice_distill": "zipvoice_distill",
 }
 
-
-def get_parser():
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
-    parser.add_argument(
-        "--onnx-int8",
-        type=str2bool,
-        default=False,
-        help="Whether to use the int8 model",
-    )
-
-    parser.add_argument(
-        "--model-name",
-        type=str,
-        default="zipvoice",
-        choices=["zipvoice", "zipvoice_distill"],
-        help="The model used for inference",
-    )
-
-    parser.add_argument(
-        "--model-dir",
-        type=str,
-        default=None,
-        help="The path to the local onnx model. "
-        "Will download pre-trained checkpoint from huggingface if not specified.",
-    )
-
-    parser.add_argument(
-        "--vocoder-path",
-        type=str,
-        default=None,
-        help="The vocoder checkpoint. "
-        "Will download pre-trained vocoder from huggingface if not specified.",
-    )
-
-    parser.add_argument(
-        "--tokenizer",
-        type=str,
-        default="emilia",
-        choices=["emilia", "libritts", "espeak", "simple"],
-        help="Tokenizer type.",
-    )
-
-    parser.add_argument(
-        "--lang",
-        type=str,
-        default="en-us",
-        help="Language identifier, used when tokenizer type is espeak. see"
-        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
-    )
-
-    parser.add_argument(
-        "--test-list",
-        type=str,
-        default=None,
-        help="The list of prompt speech, prompt_transcription, "
-        "and text to synthesizein the format of "
-        "'{wav_name}\t{prompt_transcription}\t{prompt_wav}\t{text}'.",
-    )
-
-    parser.add_argument(
-        "--prompt-wav",
-        type=str,
-        default=None,
-        help="The prompt wav to mimic",
-    )
-
-    parser.add_argument(
-        "--prompt-text",
-        type=str,
-        default=None,
-        help="The transcription of the prompt wav",
-    )
-
-    parser.add_argument(
-        "--text",
-        type=str,
-        default=None,
-        help="The text to synthesize",
-    )
-
-    parser.add_argument(
-        "--res-dir",
-        type=str,
-        default="results",
-        help="""
-        Path name of the generated wavs dir,
-        used when test-list is not None
-        """,
-    )
-
-    parser.add_argument(
-        "--res-wav-path",
-        type=str,
-        default="result.wav",
-        help="""
-        Path name of the generated wav path,
-        used when test-list is None
-        """,
-    )
-
-    parser.add_argument(
-        "--guidance-scale",
-        type=float,
-        default=None,
-        help="The scale of classifier-free guidance during inference.",
-    )
-
-    parser.add_argument(
-        "--num-step",
-        type=int,
-        default=None,
-        help="The number of sampling steps.",
-    )
-
-    parser.add_argument(
-        "--feat-scale",
-        type=float,
-        default=0.1,
-        help="The scale factor of fbank feature",
-    )
-
-    parser.add_argument(
-        "--speed",
-        type=float,
-        default=1.0,
-        help="Control speech speed, 1.0 means normal, >1.0 means speed up",
-    )
-
-    parser.add_argument(
-        "--t-shift",
-        type=float,
-        default=0.5,
-        help="Shift t to smaller ones if t_shift < 1.0",
-    )
-
-    parser.add_argument(
-        "--target-rms",
-        type=float,
-        default=0.1,
-        help="Target speech normalization rms value, set to 0 to disable normalization",
-    )
-
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=666,
-        help="Random seed",
-    )
-
-    parser.add_argument(
-        "--num-thread",
-        type=int,
-        default=1,
-        help="Number of threads to use for ONNX Runtime and PyTorch.",
-    )
-
-    parser.add_argument(
-        "--raw-evaluation",
-        type=str2bool,
-        default=False,
-        help="Whether to use the 'raw' evaluation mode where provided "
-        "prompts and text are fed to the model without pre-processing",
-    )
-
-    parser.add_argument(
-        "--remove-long-sil",
-        type=str2bool,
-        default=False,
-        help="Whether to remove long silences in the middle of the generated "
-        "speech (edge silences will be removed by default).",
-    )
-    return parser
+app = typer.Typer(
+    help="Generate speech with pre-trained ZipVoice or ZipVoice-Distill ONNX models.",
+    add_completion=False,
+)
 
 
 class OnnxModel:
+    """ONNX-based inference model for ZipVoice."""
+
     def __init__(
         self,
         text_encoder_path: str,
         fm_decoder_path: str,
         num_thread: int = 1,
     ):
+        """Initialize the ONNX model with text encoder and flow-matching decoder.
+
+        Args:
+            text_encoder_path: Path to the text encoder ONNX model.
+            fm_decoder_path: Path to the flow-matching decoder ONNX model.
+            num_thread: Number of threads for inference.
+        """
         session_opts = ort.SessionOptions()
         session_opts.inter_op_num_threads = num_thread
         session_opts.intra_op_num_threads = num_thread
@@ -289,6 +130,11 @@ class OnnxModel:
         self.init_fm_decoder(fm_decoder_path)
 
     def init_text_encoder(self, model_path: str):
+        """Initialize the text encoder ONNX session.
+
+        Args:
+            model_path: Path to the text encoder ONNX model file.
+        """
         self.text_encoder = ort.InferenceSession(
             model_path,
             sess_options=self.session_opts,
@@ -296,6 +142,11 @@ class OnnxModel:
         )
 
     def init_fm_decoder(self, model_path: str):
+        """Initialize the flow-matching decoder ONNX session.
+
+        Args:
+            model_path: Path to the flow-matching decoder ONNX model file.
+        """
         self.fm_decoder = ort.InferenceSession(
             model_path,
             sess_options=self.session_opts,
@@ -310,7 +161,18 @@ class OnnxModel:
         prompt_tokens: Tensor,
         prompt_features_len: Tensor,
         speed: Tensor,
-    ) -> Tuple[Tensor, Tensor]:
+    ) -> tuple[Tensor, Tensor]:
+        """Run the text encoder on the given inputs.
+
+        Args:
+            tokens: Text token tensor.
+            prompt_tokens: Prompt text token tensor.
+            prompt_features_len: Length of prompt features.
+            speed: Speed control tensor.
+
+        Returns:
+            Text condition tensor from the encoder.
+        """
         out = self.text_encoder.run(
             [
                 self.text_encoder.get_outputs()[0].name,
@@ -332,6 +194,18 @@ class OnnxModel:
         speech_condition: torch.Tensor,
         guidance_scale: Tensor,
     ) -> Tensor:
+        """Run the flow-matching decoder on the given inputs.
+
+        Args:
+            t: Current timestep tensor.
+            x: Current noisy features tensor.
+            text_condition: Text conditioning tensor.
+            speech_condition: Speech conditioning tensor.
+            guidance_scale: Classifier-free guidance scale tensor.
+
+        Returns:
+            Predicted velocity tensor.
+        """
         out = self.fm_decoder.run(
             [
                 self.fm_decoder.get_outputs()[0].name,
@@ -347,43 +221,47 @@ class OnnxModel:
         return torch.from_numpy(out[0])
 
 
-def sample(
+def sample(  # noqa: PLR0913
     model: OnnxModel,
-    tokens: List[List[int]],
-    prompt_tokens: List[List[int]],
+    tokens: list[list[int]],
+    prompt_tokens: list[list[int]],
     prompt_features: Tensor,
     speed: float = 1.0,
     t_shift: float = 0.5,
     guidance_scale: float = 1.0,
     num_step: int = 16,
 ) -> torch.Tensor:
-    """
-    Generate acoustic features, given text tokens, prompts feature and prompt
-    transcription's text tokens.
+    """Generate acoustic features given text tokens, prompt features and prompt tokens.
 
     Args:
-        tokens: a list of list of text tokens.
-        prompt_tokens: a list of list of prompt tokens.
-        prompt_features: the prompt feature with the shape
+        model: The ONNX model used for inference.
+        tokens: A list of list of text tokens.
+        prompt_tokens: A list of list of prompt tokens.
+        prompt_features: The prompt feature with the shape
             (batch_size, seq_len, feat_dim).
-        speed : speed control.
-        t_shift: time shift.
-        guidance_scale: the guidance scale for classifier-free guidance.
-        num_step: the number of steps to use in the ODE solver.
+        speed: Speed control.
+        t_shift: Time shift.
+        guidance_scale: The guidance scale for classifier-free guidance.
+        num_step: The number of steps to use in the ODE solver.
+
+    Returns:
+        Generated acoustic feature tensor.
     """
     # Run text encoder
-    assert len(tokens) == len(prompt_tokens) == 1
+    if len(tokens) != 1 or len(prompt_tokens) != 1:
+        msg = f"Expected len(tokens)==1 and len(prompt_tokens)==1, got {len(tokens)} and {len(prompt_tokens)}"
+        raise ValueError(msg)
     tokens = torch.tensor(tokens, dtype=torch.int64)
     prompt_tokens = torch.tensor(prompt_tokens, dtype=torch.int64)
     prompt_features_len = torch.tensor(prompt_features.size(1), dtype=torch.int64)
     speed = torch.tensor(speed, dtype=torch.float32)
 
-    text_condition = model.run_text_encoder(
-        tokens, prompt_tokens, prompt_features_len, speed
-    )
+    text_condition = model.run_text_encoder(tokens, prompt_tokens, prompt_features_len, speed)
 
     batch_size, num_frames, _ = text_condition.shape
-    assert batch_size == 1
+    if batch_size != 1:
+        msg = f"Expected batch_size == 1, got {batch_size}"
+        raise ValueError(msg)
     feat_dim = model.feat_dim
 
     # Run flow matching model
@@ -414,7 +292,7 @@ def sample(
 
 
 # Copied from zipvoice/bin/infer_zipvoice.py, but call an external sample function
-def generate_sentence_raw_evaluation(
+def generate_sentence_raw_evaluation(  # noqa: PLR0913
     save_path: str,
     prompt_text: str,
     prompt_wav: str,
@@ -431,12 +309,12 @@ def generate_sentence_raw_evaluation(
     feat_scale: float = 0.1,
     sampling_rate: int = 24000,
 ):
-    """
-    Generate waveform of a text based on a given prompt waveform and its transcription,
-        this function directly feed the prompt_text, prompt_wav and text to the model.
-        It is not efficient and can have poor results for some inappropriate inputs.
-        (e.g., prompt wav contains long silence, text to be generated is too long)
-        This function can be used to evaluate the "raw" performance of the model.
+    """Generate waveform of a text based on a given prompt waveform and its transcription.
+
+    This function directly feed the prompt_text, prompt_wav and text to the model.
+    It is not efficient and can have poor results for some inappropriate inputs.
+    (e.g., prompt wav contains long silence, text to be generated is too long)
+    This function can be used to evaluate the "raw" performance of the model.
 
     Args:
         save_path (str): Path to save the generated wav.
@@ -459,11 +337,11 @@ def generate_sentence_raw_evaluation(
             Defaults to 0.1.
         sampling_rate (int, optional): Sampling rate for the waveform.
             Defaults to 24000.
+
     Returns:
         metrics (dict): Dictionary containing time and real-time
             factor metrics for processing.
     """
-
     # Load and process prompt wav
     prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
     prompt_wav, prompt_rms = rms_norm(prompt_wav, target_rms)
@@ -525,7 +403,7 @@ def generate_sentence_raw_evaluation(
     return metrics
 
 
-def generate_sentence(
+def generate_sentence(  # noqa: PLR0913
     save_path: str,
     prompt_text: str,
     prompt_wav: str,
@@ -543,13 +421,13 @@ def generate_sentence(
     sampling_rate: int = 24000,
     remove_long_sil: bool = False,
 ):
-    """
-    Generate waveform of a text based on a given prompt waveform and its transcription,
-        this function will do the following to improve the generation quality:
-        1. chunk the text according to punctuations.
-        2. process chunked texts sequentially.
-        3. remove long silences in the prompt audio.
-        4. add punctuation to the end of prompt text and text if there is not.
+    """Generate waveform of a text based on a given prompt waveform and its transcription.
+
+    This function will do the following to improve the generation quality:
+    1. chunk the text according to punctuations.
+    2. process chunked texts sequentially.
+    3. remove long silences in the prompt audio.
+    4. add punctuation to the end of prompt text and text if there is not.
 
     Args:
         save_path (str): Path to save the generated wav.
@@ -574,33 +452,31 @@ def generate_sentence(
             Defaults to 24000.
         remove_long_sil (bool, optional): Whether to remove long silences in the
             middle of the generated speech (edge silences will be removed by default).
+
     Returns:
         metrics (dict): Dictionary containing time and real-time
             factor metrics for processing.
     """
-
     # Load and process prompt wav
     prompt_wav = load_prompt_wav(prompt_wav, sampling_rate=sampling_rate)
 
     # Remove edge and long silences in the prompt wav.
     # Add 0.2s trailing silence to avoid leaking prompt to generated speech.
-    prompt_wav = remove_silence(
-        prompt_wav, sampling_rate, only_edge=False, trail_sil=200
-    )
+    prompt_wav = remove_silence(prompt_wav, sampling_rate, only_edge=False, trail_sil=200)
 
     prompt_wav, prompt_rms = rms_norm(prompt_wav, target_rms)
 
     prompt_duration = prompt_wav.shape[-1] / sampling_rate
 
     if prompt_duration > 20:
-        logging.warning(
-            f"Given prompt wav is too long ({prompt_duration}s). "
-            f"Please provide a shorter one (1-3 seconds is recommended)."
+        log.warning(
+            "prompt_wav_too_long",
+            prompt_duration=prompt_duration,
         )
     elif prompt_duration > 10:
-        logging.warning(
-            f"Given prompt wav is long ({prompt_duration}s). "
-            f"It will lead to slower inference speed and possibly worse speech quality."
+        log.warning(
+            "prompt_wav_long",
+            prompt_duration=prompt_duration,
         )
 
     # Extract features from prompt wav
@@ -617,13 +493,11 @@ def generate_sentence(
     prompt_tokens_str = tokenizer.texts_to_tokens([prompt_text])[0]
 
     # chunk text so that each len(prompt wav + generated wav) is around 25 seconds.
-    token_duration = (prompt_wav.shape[-1] / sampling_rate) / (
-        len(prompt_tokens_str) * speed
-    )
+    token_duration = (prompt_wav.shape[-1] / sampling_rate) / (len(prompt_tokens_str) * speed)
     max_tokens = int((25 - prompt_duration) / token_duration)
     chunked_tokens_str = chunk_tokens_punctuation(tokens_str, max_tokens=max_tokens)
-    print(len(chunked_tokens_str))
-    print(chunked_tokens_str)
+    log.debug("chunked_tokens_count", count=len(chunked_tokens_str))
+    log.debug("chunked_tokens", tokens=chunked_tokens_str)
 
     # Tokenize text (int tokens)
     chunked_tokens = tokenizer.tokens_to_token_ids(chunked_tokens_str)
@@ -633,7 +507,6 @@ def generate_sentence(
     chunked_features = []
     start_t = dt.datetime.now()
     for tokens in chunked_tokens:
-
         # Generate features
         pred_features = sample(
             model=model,
@@ -665,11 +538,8 @@ def generate_sentence(
     t = (dt.datetime.now() - start_t).total_seconds()
 
     # Merge chunked wavs
-    final_wav = cross_fade_concat(
-        chunked_wavs, fade_duration=0.1, sample_rate=sampling_rate
-    )
-    final_wav = remove_silence(
-        final_wav, sampling_rate, only_edge=(not remove_long_sil), trail_sil=0
+    final_wav = merge_chunked_wavs(
+        chunked_wavs, chunked_index=None, remove_long_sil=remove_long_sil, sampling_rate=sampling_rate
     )
 
     # Calculate processing time metrics
@@ -693,7 +563,7 @@ def generate_sentence(
     return metrics
 
 
-def generate_list(
+def generate_list(  # noqa: PLR0913
     res_dir: str,
     test_list: str,
     model: OnnxModel,
@@ -710,12 +580,31 @@ def generate_list(
     raw_evaluation: bool = False,
     remove_long_sil: bool = False,
 ):
+    """Generate speech for a list of test samples using ONNX models and report metrics.
+
+    Args:
+        res_dir: Directory to save generated wavs.
+        test_list: Path to TSV file with test samples.
+        model: The ONNX model for generation.
+        vocoder: The vocoder model.
+        tokenizer: The tokenizer for text.
+        feature_extractor: Feature extractor for audio.
+        num_step: Number of decoding steps.
+        guidance_scale: Classifier-free guidance scale.
+        speed: Speed control factor.
+        t_shift: Time shift for ODE solver.
+        target_rms: Target RMS normalization value.
+        feat_scale: Feature scale factor.
+        sampling_rate: Audio sampling rate.
+        raw_evaluation: Whether to use raw evaluation mode.
+        remove_long_sil: Whether to remove long silences.
+    """
     total_t = []
     total_t_no_vocoder = []
     total_t_vocoder = []
     total_wav_seconds = []
 
-    with open(test_list, "r") as fr:
+    with open(test_list) as fr:
         lines = fr.readlines()
 
     for i, line in enumerate(lines):
@@ -747,35 +636,149 @@ def generate_list(
                 **common_params,
                 remove_long_sil=remove_long_sil,
             )
-        logging.info(f"[Sentence: {i}] Saved to: {save_path}")
-        logging.info(f"[Sentence: {i}] RTF: {metrics['rtf']:.4f}")
+        log.info("sentence_saved", sentence=i, save_path=save_path)
+        log.info("sentence_rtf", sentence=i, rtf=round(metrics["rtf"], 4))
         total_t.append(metrics["t"])
         total_t_no_vocoder.append(metrics["t_no_vocoder"])
         total_t_vocoder.append(metrics["t_vocoder"])
         total_wav_seconds.append(metrics["wav_seconds"])
 
-    logging.info(f"Average RTF: {np.sum(total_t) / np.sum(total_wav_seconds):.4f}")
-    logging.info(
-        f"Average RTF w/o vocoder: "
-        f"{np.sum(total_t_no_vocoder) / np.sum(total_wav_seconds):.4f}"
+    log.info("average_rtf", rtf=round(np.sum(total_t) / np.sum(total_wav_seconds), 4))
+    log.info(
+        "average_rtf_no_vocoder",
+        rtf=round(np.sum(total_t_no_vocoder) / np.sum(total_wav_seconds), 4),
     )
-    logging.info(
-        f"Average RTF vocoder: "
-        f"{np.sum(total_t_vocoder) / np.sum(total_wav_seconds):.4f}"
+    log.info(
+        "average_rtf_vocoder",
+        rtf=round(np.sum(total_t_vocoder) / np.sum(total_wav_seconds), 4),
     )
 
 
+@app.command()
 @torch.inference_mode()
-def main():
-    parser = get_parser()
-    args = parser.parse_args()
+def main(  # noqa: PLR0912, PLR0913, PLR0915, C901
+    onnx_int8: bool = typer.Option(  # noqa: B008
+        False,
+        "--onnx-int8",
+        help="Whether to use the int8 model",
+    ),
+    model_name: str = typer.Option(
+        "zipvoice",
+        "--model-name",
+        help="The model used for inference",
+    ),
+    model_dir: str | None = typer.Option(
+        None,
+        "--model-dir",
+        help="The path to the local onnx model. "
+        "Will download pre-trained checkpoint from huggingface if not specified.",
+    ),
+    vocoder_path: str | None = typer.Option(
+        None,
+        "--vocoder-path",
+        help="The vocoder checkpoint. Will download pre-trained vocoder from huggingface if not specified.",
+    ),
+    tokenizer: str = typer.Option(
+        "emilia",
+        "--tokenizer",
+        help="Tokenizer type.",
+    ),
+    lang: str = typer.Option(
+        "en-us",
+        "--lang",
+        help="Language identifier, used when tokenizer type is espeak. see"
+        "https://github.com/rhasspy/espeak-ng/blob/master/docs/languages.md",
+    ),
+    test_list: str | None = typer.Option(
+        None,
+        "--test-list",
+        help="The list of prompt speech, prompt_transcription, "
+        "and text to synthesize in the format of "
+        "'{wav_name}\\t{prompt_transcription}\\t{prompt_wav}\\t{text}'.",
+    ),
+    prompt_wav: str | None = typer.Option(
+        None,
+        "--prompt-wav",
+        help="The prompt wav to mimic",
+    ),
+    prompt_text: str | None = typer.Option(
+        None,
+        "--prompt-text",
+        help="The transcription of the prompt wav",
+    ),
+    text: str | None = typer.Option(
+        None,
+        "--text",
+        help="The text to synthesize",
+    ),
+    res_dir: str = typer.Option(
+        "results",
+        "--res-dir",
+        help="Path name of the generated wavs dir, used when test-list is not None",
+    ),
+    res_wav_path: str = typer.Option(
+        "result.wav",
+        "--res-wav-path",
+        help="Path name of the generated wav path, used when test-list is None",
+    ),
+    guidance_scale: float | None = typer.Option(
+        None,
+        "--guidance-scale",
+        help="The scale of classifier-free guidance during inference.",
+    ),
+    num_step: int | None = typer.Option(
+        None,
+        "--num-step",
+        help="The number of sampling steps.",
+    ),
+    feat_scale: float = typer.Option(
+        0.1,
+        "--feat-scale",
+        help="The scale factor of fbank feature",
+    ),
+    speed: float = typer.Option(
+        1.0,
+        "--speed",
+        help="Control speech speed, 1.0 means normal, >1.0 means speed up",
+    ),
+    t_shift: float = typer.Option(
+        0.5,
+        "--t-shift",
+        help="Shift t to smaller ones if t_shift < 1.0",
+    ),
+    target_rms: float = typer.Option(
+        0.1,
+        "--target-rms",
+        help="Target speech normalization rms value, set to 0 to disable normalization",
+    ),
+    seed: int = typer.Option(
+        666,
+        "--seed",
+        help="Random seed",
+    ),
+    num_thread: int = typer.Option(
+        1,
+        "--num-thread",
+        help="Number of threads to use for ONNX Runtime and PyTorch.",
+    ),
+    raw_evaluation: bool = typer.Option(
+        False,
+        "--raw-evaluation",
+        help="Whether to use the 'raw' evaluation mode where provided "
+        "prompts and text are fed to the model without pre-processing",
+    ),
+    remove_long_sil: bool = typer.Option(
+        False,
+        "--remove-long-sil",
+        help="Whether to remove long silences in the middle of the generated "
+        "speech (edge silences will be removed by default).",
+    ),
+) -> None:
+    """Run speech synthesis inference using ZipVoice ONNX models."""
+    torch.set_num_threads(num_thread)
+    torch.set_num_interop_threads(num_thread)
 
-    torch.set_num_threads(args.num_thread)
-    torch.set_num_interop_threads(args.num_thread)
-
-    params = AttributeDict()
-    params.update(vars(args))
-    fix_random_seed(params.seed)
+    fix_random_seed(seed)
 
     model_defaults = {
         "zipvoice": {
@@ -788,31 +791,34 @@ def main():
         },
     }
 
-    model_specific_defaults = model_defaults.get(params.model_name, {})
+    model_specific_defaults = model_defaults.get(model_name, {})
 
-    for param, value in model_specific_defaults.items():
-        if getattr(params, param) is None:
-            setattr(params, param, value)
-            logging.info(f"Setting {param} to default value: {value}")
+    if num_step is None:
+        num_step = model_specific_defaults.get("num_step", 16)
+        log.info("setting_default_param", param="num_step", value=num_step)
+    if guidance_scale is None:
+        guidance_scale = model_specific_defaults.get("guidance_scale", 1.0)
+        log.info("setting_default_param", param="guidance_scale", value=guidance_scale)
 
-    assert (params.test_list is not None) ^ (
-        (params.prompt_wav and params.prompt_text and params.text) is not None
-    ), (
-        "For inference, please provide prompts and text with either '--test-list'"
-        " or '--prompt-wav, --prompt-text and --text'."
-    )
+    if not ((test_list is not None) ^ ((prompt_wav and prompt_text and text) is not None)):
+        msg = (
+            "For inference, please provide prompts and text with either '--test-list'"
+            " or '--prompt-wav, --prompt-text and --text'."
+        )
+        raise ValueError(msg)
 
-    if params.onnx_int8:
+    if onnx_int8:
         text_encoder_name = "text_encoder_int8.onnx"
         fm_decoder_name = "fm_decoder_int8.onnx"
     else:
         text_encoder_name = "text_encoder.onnx"
         fm_decoder_name = "fm_decoder.onnx"
 
-    if params.model_dir is not None:
-        params.model_dir = Path(params.model_dir)
-        if not params.model_dir.is_dir():
-            raise FileNotFoundError(f"{params.model_dir} does not exist")
+    if model_dir is not None:
+        model_dir_path = Path(model_dir)
+        if not model_dir_path.is_dir():
+            msg = f"{model_dir_path} does not exist"
+            raise FileNotFoundError(msg)
 
         for filename in [
             text_encoder_name,
@@ -820,105 +826,102 @@ def main():
             "model.json",
             "tokens.txt",
         ]:
-            if not (params.model_dir / filename).is_file():
-                raise FileNotFoundError(f"{params.model_dir / filename} does not exist")
-        text_encoder_path = params.model_dir / text_encoder_name
-        fm_decoder_path = params.model_dir / fm_decoder_name
-        model_config = params.model_dir / "model.json"
-        token_file = params.model_dir / "tokens.txt"
-        logging.info(f"Using local model dir {params.model_dir}.")
+            if not (model_dir_path / filename).is_file():
+                msg = f"{model_dir_path / filename} does not exist"
+                raise FileNotFoundError(msg)
+        text_encoder_path = model_dir_path / text_encoder_name
+        fm_decoder_path = model_dir_path / fm_decoder_name
+        model_config_path = model_dir_path / "model.json"
+        token_file = model_dir_path / "tokens.txt"
+        log.info("using_local_model_dir", model_dir=model_dir)
     else:
-        logging.info("Using pretrained model from the Huggingface")
+        log.info("using_pretrained_model")
         text_encoder_path = hf_hub_download(
             HUGGINGFACE_REPO,
-            filename=f"{MODEL_DIR[params.model_name]}/{text_encoder_name}",
+            filename=f"{MODEL_DIR[model_name]}/{text_encoder_name}",
         )
         fm_decoder_path = hf_hub_download(
             HUGGINGFACE_REPO,
-            filename=f"{MODEL_DIR[params.model_name]}/{fm_decoder_name}",
+            filename=f"{MODEL_DIR[model_name]}/{fm_decoder_name}",
         )
-        model_config = hf_hub_download(
-            HUGGINGFACE_REPO, filename=f"{MODEL_DIR[params.model_name]}/model.json"
-        )
+        model_config_path = hf_hub_download(HUGGINGFACE_REPO, filename=f"{MODEL_DIR[model_name]}/model.json")
 
-        token_file = hf_hub_download(
-            HUGGINGFACE_REPO, filename=f"{MODEL_DIR[params.model_name]}/tokens.txt"
-        )
+        token_file = hf_hub_download(HUGGINGFACE_REPO, filename=f"{MODEL_DIR[model_name]}/tokens.txt")
 
-    if params.tokenizer == "emilia":
-        tokenizer = EmiliaTokenizer(token_file=token_file)
-    elif params.tokenizer == "libritts":
-        tokenizer = LibriTTSTokenizer(token_file=token_file)
-    elif params.tokenizer == "espeak":
-        tokenizer = EspeakTokenizer(token_file=token_file, lang=params.lang)
+    if tokenizer == "emilia":
+        tokenizer_obj = EmiliaTokenizer(token_file=token_file)
+    elif tokenizer == "libritts":
+        tokenizer_obj = LibriTTSTokenizer(token_file=token_file)
+    elif tokenizer == "espeak":
+        tokenizer_obj = EspeakTokenizer(token_file=token_file, lang=lang)
     else:
-        assert params.tokenizer == "simple"
-        tokenizer = SimpleTokenizer(token_file=token_file)
+        if tokenizer != "simple":
+            msg = f"Unsupported tokenizer: {tokenizer}"
+            raise ValueError(msg)
+        tokenizer_obj = SimpleTokenizer(token_file=token_file)
 
-    with open(model_config, "r") as f:
-        model_config = json.load(f)
+    with open(model_config_path, "rb") as f:
+        model_config = orjson.loads(f.read())
 
-    model = OnnxModel(text_encoder_path, fm_decoder_path, num_thread=args.num_thread)
+    model_obj = OnnxModel(text_encoder_path, fm_decoder_path, num_thread=num_thread)
 
-    vocoder = get_vocoder(params.vocoder_path)
+    vocoder = get_vocoder(vocoder_path)
     vocoder.eval()
 
     if model_config["feature"]["type"] == "vocos":
         feature_extractor = VocosFbank()
     else:
-        raise NotImplementedError(
-            f"Unsupported feature type: {model_config['feature']['type']}"
-        )
-    params.sampling_rate = model_config["feature"]["sampling_rate"]
+        msg = f"Unsupported feature type: {model_config['feature']['type']}"
+        raise ValueError(msg)
+    sampling_rate = model_config["feature"]["sampling_rate"]
 
-    logging.info("Start generating...")
-    if params.test_list:
-        os.makedirs(params.res_dir, exist_ok=True)
+    log.info("start_generating")
+    if test_list:
+        os.makedirs(res_dir, exist_ok=True)
         generate_list(
-            res_dir=params.res_dir,
-            test_list=params.test_list,
-            model=model,
+            res_dir=res_dir,
+            test_list=test_list,
+            model=model_obj,
             vocoder=vocoder,
-            tokenizer=tokenizer,
+            tokenizer=tokenizer_obj,
             feature_extractor=feature_extractor,
-            num_step=params.num_step,
-            guidance_scale=params.guidance_scale,
-            speed=params.speed,
-            t_shift=params.t_shift,
-            target_rms=params.target_rms,
-            feat_scale=params.feat_scale,
-            sampling_rate=params.sampling_rate,
-            raw_evaluation=params.raw_evaluation,
-            remove_long_sil=params.remove_long_sil,
+            num_step=num_step,
+            guidance_scale=guidance_scale,
+            speed=speed,
+            t_shift=t_shift,
+            target_rms=target_rms,
+            feat_scale=feat_scale,
+            sampling_rate=sampling_rate,
+            raw_evaluation=raw_evaluation,
+            remove_long_sil=remove_long_sil,
         )
     else:
-        assert (
-            not params.raw_evaluation
-        ), "Raw evaluation is only valid with --test-list"
+        if raw_evaluation:
+            msg = "Raw evaluation is only valid with --test-list"
+            raise ValueError(msg)
         generate_sentence(
-            save_path=params.res_wav_path,
-            prompt_text=params.prompt_text,
-            prompt_wav=params.prompt_wav,
-            text=params.text,
-            model=model,
+            save_path=res_wav_path,
+            prompt_text=prompt_text,
+            prompt_wav=prompt_wav,
+            text=text,
+            model=model_obj,
             vocoder=vocoder,
-            tokenizer=tokenizer,
+            tokenizer=tokenizer_obj,
             feature_extractor=feature_extractor,
-            num_step=params.num_step,
-            guidance_scale=params.guidance_scale,
-            speed=params.speed,
-            t_shift=params.t_shift,
-            target_rms=params.target_rms,
-            feat_scale=params.feat_scale,
-            sampling_rate=params.sampling_rate,
-            remove_long_sil=params.remove_long_sil,
+            num_step=num_step,
+            guidance_scale=guidance_scale,
+            speed=speed,
+            t_shift=t_shift,
+            target_rms=target_rms,
+            feat_scale=feat_scale,
+            sampling_rate=sampling_rate,
+            remove_long_sil=remove_long_sil,
         )
-        logging.info(f"Saved to: {params.res_wav_path}")
-    logging.info("Done")
+        log.info("saved", path=res_wav_path)
+    log.info("done")
 
 
 if __name__ == "__main__":
-    formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
-    logging.basicConfig(format=formatter, level=logging.INFO, force=True)
+    app()
 
-    main()
+# end zipvoice/bin/infer_zipvoice_onnx.py

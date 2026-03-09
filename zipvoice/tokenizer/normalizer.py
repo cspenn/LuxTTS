@@ -1,3 +1,6 @@
+# start zipvoice/tokenizer/normalizer.py
+"""Text normalizers for English and Chinese TTS preprocessing."""
+
 import re
 from abc import ABC, abstractmethod
 
@@ -15,15 +18,17 @@ class TextNormalizer(ABC):
 
 
 class EnglishTextNormalizer(TextNormalizer):
-    """
-    A class to handle preprocessing of English text including normalization. Following:
-    https://github.com/espnet/espnet_tts_frontend/blob/master/tacotron_cleaner/cleaners.py
+    """A class to handle preprocessing of English text including normalization.
+
+    Following:
+    https://github.com/espnet/espnet_tts_frontend/blob/master/tacotron_cleaner/cleaners.py.
     """
 
     def __init__(self):
+        """Initialize abbreviation patterns and regex helpers."""
         # List of (regular expression, replacement) pairs for abbreviations:
         self._abbreviations = [
-            (re.compile("\\b%s\\b" % x[0], re.IGNORECASE), x[1])
+            (re.compile(f"\\b{x[0]}\\b", re.IGNORECASE), x[1])
             for x in [
                 ("mrs", "misess"),
                 ("mr", "mister"),
@@ -60,14 +65,25 @@ class EnglishTextNormalizer(TextNormalizer):
         self._whitespace_re = re.compile(r"\s+")
 
     def normalize(self, text: str) -> str:
-        """Custom pipeline for English text,
-        including number and abbreviation expansion."""
+        """Custom pipeline for English text.
+
+        Includes number and abbreviation expansion.
+        """
         text = self.expand_abbreviations(text)
         text = self.normalize_numbers(text)
 
         return text
 
     def fraction_to_words(self, numerator, denominator):
+        """Convert a fraction to its English word representation.
+
+        Args:
+            numerator: The numerator of the fraction.
+            denominator: The denominator of the fraction.
+
+        Returns:
+            String with the fraction expressed in words.
+        """
         if numerator == 1 and denominator == 2:
             return " one half "
         if numerator == 1 and denominator == 4:
@@ -97,13 +113,13 @@ class EnglishTextNormalizer(TextNormalizer):
         if dollars and cents:
             dollar_unit = "dollar" if dollars == 1 else "dollars"
             cent_unit = "cent" if cents == 1 else "cents"
-            return " %s %s, %s %s " % (dollars, dollar_unit, cents, cent_unit)
+            return f" {dollars} {dollar_unit}, {cents} {cent_unit} "
         elif dollars:
             dollar_unit = "dollar" if dollars == 1 else "dollars"
-            return " %s %s " % (dollars, dollar_unit)
+            return f" {dollars} {dollar_unit} "
         elif cents:
             cent_unit = "cent" if cents == 1 else "cents"
-            return " %s %s " % (cents, cent_unit)
+            return f" {cents} {cent_unit} "
         else:
             return " zero dollars "
 
@@ -131,17 +147,19 @@ class EnglishTextNormalizer(TextNormalizer):
             elif num % 100 == 0:
                 return " " + self._inflect.number_to_words(num // 100) + " hundred "
             else:
-                return (
-                    " "
-                    + self._inflect.number_to_words(
-                        num, andword="", zero="oh", group=2
-                    ).replace(", ", " ")
-                    + " "
-                )
+                return " " + self._inflect.number_to_words(num, andword="", zero="oh", group=2).replace(", ", " ") + " "
         else:
             return " " + self._inflect.number_to_words(num, andword="") + " "
 
     def normalize_numbers(self, text):
+        """Apply all number expansion substitutions to text.
+
+        Args:
+            text: Input text string.
+
+        Returns:
+            Text with numbers expanded to words.
+        """
         text = re.sub(self._comma_number_re, self._remove_commas, text)
         text = re.sub(self._pounds_re, r"\1 pounds", text)
         text = re.sub(self._dollars_re, self._expand_dollars, text)
@@ -153,18 +171,27 @@ class EnglishTextNormalizer(TextNormalizer):
         return text
 
     def expand_abbreviations(self, text):
+        """Expand common English abbreviations in text.
+
+        Args:
+            text: Input text string.
+
+        Returns:
+            Text with abbreviations expanded.
+        """
         for regex, replacement in self._abbreviations:
             text = re.sub(regex, replacement, text)
         return text
 
 
 class ChineseTextNormalizer(TextNormalizer):
-    """
-    A class to handle preprocessing of Chinese text including normalization.
-    """
+    """A class to handle preprocessing of Chinese text including normalization."""
 
     def normalize(self, text: str) -> str:
         """Normalize text."""
         # Convert numbers to Chinese
         text = cn2an.transform(text, "an2cn")
         return text
+
+
+# end zipvoice/tokenizer/normalizer.py

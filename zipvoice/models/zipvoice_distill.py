@@ -1,3 +1,6 @@
+"""ZipVoiceDistill: consistency-distilled TTS model for fast synthesis."""
+
+# start zipvoice/models/zipvoice_distill.py
 # Copyright    2024    Xiaomi Corp.        (authors:  Wei Kang
 #                                                     Han Zhu)
 #
@@ -15,8 +18,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
-
 import torch
 
 from zipvoice.models.modules.solver import DistillEulerSolver
@@ -25,9 +26,17 @@ from zipvoice.models.zipvoice import ZipVoice
 
 
 class ZipVoiceDistill(ZipVoice):
-    """ZipVoice-Distill model."""
+    """Flow-matching TTS model trained with consistency distillation.
+
+    Extends ``ZipVoice`` by replacing the standard Euler solver with a
+    distilled ``DistillEulerSolver``, enabling high-quality synthesis in
+    very few ODE steps (typically 1–4).  The flow-matching decoder is
+    rebuilt with an additional guidance-scale embedding so that
+    classifier-free guidance can be applied efficiently during distillation.
+    """
 
     def __init__(self, *args, **kwargs):
+        """Initialize ZipVoiceDistill, replacing the solver with DistillEulerSolver."""
         super().__init__(*args, **kwargs)
 
         required_params = {
@@ -47,7 +56,8 @@ class ZipVoiceDistill(ZipVoice):
 
         missing = [p for p in required_params if p not in kwargs]
         if missing:
-            raise ValueError(f"Missing required parameters: {', '.join(missing)}")
+            msg = f"Missing required parameters: {', '.join(missing)}"
+            raise ValueError(msg)
 
         self.fm_decoder = TTSZipformer(
             in_dim=kwargs["feat_dim"] * 3,
@@ -68,9 +78,9 @@ class ZipVoiceDistill(ZipVoice):
         )
         self.solver = DistillEulerSolver(self, func_name="forward_fm_decoder")
 
-    def forward(
+    def forward(  # noqa: PLR0913
         self,
-        tokens: List[List[int]],
+        tokens: list[list[int]],
         features: torch.Tensor,
         features_lens: torch.Tensor,
         noise: torch.Tensor,
@@ -80,7 +90,28 @@ class ZipVoiceDistill(ZipVoice):
         num_step: int = 1,
         guidance_scale: torch.Tensor = None,
     ) -> torch.Tensor:
+        """Run the distillation forward pass for a single time-interval step.
 
+        Delegates to ``sample_intermediate`` to integrate the ODE from
+        ``t_start`` to ``t_end`` using the distilled solver.
+
+        Args:
+            tokens: Text token ID sequences, one list per batch item.
+            features: Acoustic features of shape (B, T, feat_dim).
+            features_lens: Length of each feature sequence, shape (B,).
+            noise: Initial noise tensor of shape (B, T, feat_dim).
+            speech_condition_mask: Boolean mask of shape (B, T); ``True``
+                positions are non-condition (to be generated).
+            t_start: Start timestep for this ODE interval (in [0, 1]).
+            t_end: End timestep for this ODE interval (in [0, 1]).
+            num_step: Number of solver steps within ``[t_start, t_end]``.
+            guidance_scale: Classifier-free guidance scale tensor of shape
+                (B, 1, 1), or ``None`` to disable guidance.
+
+        Returns:
+            Predicted acoustic features at timestep ``t_end``, shape
+            (B, T, feat_dim).
+        """
         return self.sample_intermediate(
             tokens=tokens,
             features=features,
@@ -92,3 +123,6 @@ class ZipVoiceDistill(ZipVoice):
             num_step=num_step,
             guidance_scale=guidance_scale,
         )
+
+
+# end zipvoice/models/zipvoice_distill.py

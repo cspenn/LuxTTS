@@ -1,3 +1,4 @@
+# start zipvoice/bin/tensorrt_export.py
 #!/usr/bin/env python3
 # Copyright         2025  Xiaomi Corp.        (authors: Zengwei Yao)
 # Copyright         2025  Nvidia Corp.        (authors: Yuekai Zhang)
@@ -16,9 +17,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-This script exports a pre-trained ZipVoice or ZipVoice-Distill model from PyTorch to
-ONNX.
+"""Export a pre-trained ZipVoice or ZipVoice-Distill model from PyTorch to TensorRT.
+
+This script exports the model from PyTorch to ONNX and converts to TensorRT engine.
 
 Usage:
 
@@ -33,25 +34,27 @@ python3 -m zipvoice.bin.tensorrt_export \
     which are the models before and after distillation, respectively.
 """
 
-
-import argparse
-import json
-import logging
 from pathlib import Path
-from typing import Dict
-import math
 
-import safetensors.torch
-import torch
-from torch import Tensor, nn
+import orjson
+import structlog
+import typer
 
-from zipvoice.models.zipvoice import ZipVoice
-from zipvoice.models.zipvoice_distill import ZipVoiceDistill
-from zipvoice.tokenizer.tokenizer import SimpleTokenizer
-from zipvoice.utils.checkpoint import load_checkpoint
-from zipvoice.utils.common import AttributeDict
-from zipvoice.utils.scaling_converter import convert_scaled_to_non_scaled
-from zipvoice.models.modules.zipformer import CompactRelPositionalEncoding
+log = structlog.get_logger()
+import math  # noqa: E402
+
+import safetensors.torch  # noqa: E402
+import torch  # noqa: E402
+from torch import Tensor  # noqa: E402
+
+from zipvoice.models.modules.zipformer import CompactRelPositionalEncoding  # noqa: E402
+from zipvoice.models.zipvoice import ZipVoice  # noqa: E402
+from zipvoice.models.zipvoice_distill import ZipVoiceDistill  # noqa: E402
+from zipvoice.tokenizer.tokenizer import SimpleTokenizer  # noqa: E402
+from zipvoice.utils.checkpoint import load_checkpoint  # noqa: E402
+from zipvoice.utils.common import AttributeDict  # noqa: E402
+from zipvoice.utils.scaling_converter import convert_scaled_to_non_scaled  # noqa: E402
+
 
 # Monkey-patching CompactRelPositionalEncoding.extend_pe
 def extend_pe(self, x: Tensor, left_context_len: int = 0) -> None:
@@ -77,11 +80,7 @@ def extend_pe(self, x: Tensor, left_context_len: int = 0) -> None:
     # to infinity; but it does so more slowly than T for large absolute values of T.
     # The formula is chosen so that d(x_compressed )/dx is 1 around x == 0, which is
     # important.
-    x_compressed = (
-        compression_length
-        * x.sign()
-        * ((x.abs() + compression_length).log() - math.log(compression_length))
-    )
+    x_compressed = compression_length * x.sign() * ((x.abs() + compression_length).log() - math.log(compression_length))
 
     # if self.length_factor == 1.0, then length_scale is chosen so that the
     # FFT can exactly separate points close to the origin (T == 0).  So this
@@ -113,15 +112,30 @@ def get_trt_kwargs_dynamic_batch(
     min_batch_size: int = 1,
     opt_batch_size: int = 2,
     max_batch_size: int = 4,
-) -> Dict:
+) -> dict:
     """Get keyword arguments for TensorRT with dynamic batch size."""
     feat_dim = 300
     min_seq_len = 100
     opt_seq_len = 200
     max_seq_len = 3000
-    min_shape = [(min_batch_size, min_seq_len, feat_dim), (min_batch_size,), (min_batch_size, min_seq_len), (min_batch_size,)]
-    opt_shape = [(opt_batch_size, opt_seq_len, feat_dim), (opt_batch_size,), (opt_batch_size, opt_seq_len), (opt_batch_size,)]
-    max_shape = [(max_batch_size, max_seq_len, feat_dim), (max_batch_size,), (max_batch_size, max_seq_len), (max_batch_size,)]
+    min_shape = [
+        (min_batch_size, min_seq_len, feat_dim),
+        (min_batch_size,),
+        (min_batch_size, min_seq_len),
+        (min_batch_size,),
+    ]
+    opt_shape = [
+        (opt_batch_size, opt_seq_len, feat_dim),
+        (opt_batch_size,),
+        (opt_batch_size, opt_seq_len),
+        (opt_batch_size,),
+    ]
+    max_shape = [
+        (max_batch_size, max_seq_len, feat_dim),
+        (max_batch_size,),
+        (max_batch_size, max_seq_len),
+        (max_batch_size,),
+    ]
     input_names = ["x", "t", "padding_mask", "guidance_scale"]
     return {
         "min_shape": min_shape,
@@ -131,11 +145,8 @@ def get_trt_kwargs_dynamic_batch(
     }
 
 
-def convert_onnx_to_trt(
-    trt_model: str, trt_kwargs: Dict, onnx_model: str, dtype: torch.dtype = torch.float16
-):
-    """
-    Convert an ONNX model to a TensorRT engine.
+def convert_onnx_to_trt(trt_model: str, trt_kwargs: dict, onnx_model: str, dtype: torch.dtype = torch.float16):
+    """Convert an ONNX model to a TensorRT engine.
 
     Args:
         trt_model (str): The path to save the TensorRT engine.
@@ -143,7 +154,7 @@ def convert_onnx_to_trt(
         onnx_model (str): The path to the ONNX model.
         dtype (torch.dtype, optional): The data type to use. Defaults to torch.float16.
     """
-    logging.info("Converting onnx to trt...")
+    log.info("converting_onnx_to_trt")
     network_flags = 1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH)
     logger = trt.Logger(trt.Logger.INFO)
     builder = trt.Builder(logger)
@@ -159,11 +170,17 @@ def convert_onnx_to_trt(
     with open(onnx_model, "rb") as f:
         if not parser.parse(f.read()):
             for error in range(parser.num_errors):
-                print(parser.get_error(error))
-            raise ValueError('failed to parse {}'.format(onnx_model))
+                logger.error(parser.get_error(error))
+            msg = f"failed to parse {onnx_model}"
+            raise ValueError(msg)
     # set input shapes
-    for i in range(len(trt_kwargs['input_names'])):
-        profile.set_shape(trt_kwargs['input_names'][i], trt_kwargs['min_shape'][i], trt_kwargs['opt_shape'][i], trt_kwargs['max_shape'][i])
+    for i in range(len(trt_kwargs["input_names"])):
+        profile.set_shape(
+            trt_kwargs["input_names"][i],
+            trt_kwargs["min_shape"][i],
+            trt_kwargs["opt_shape"][i],
+            trt_kwargs["max_shape"][i],
+        )
     if dtype == torch.float16:
         tensor_dtype = trt.DataType.HALF
     elif dtype == torch.bfloat16:
@@ -171,7 +188,8 @@ def convert_onnx_to_trt(
     elif dtype == torch.float32:
         tensor_dtype = trt.DataType.FLOAT
     else:
-        raise ValueError('invalid dtype {}'.format(dtype))
+        msg = f"invalid dtype {dtype}"
+        raise ValueError(msg)
     # set input and output data type
     for i in range(network.num_inputs):
         input_tensor = network.get_input(i)
@@ -184,60 +202,11 @@ def convert_onnx_to_trt(
     # save trt engine
     with open(trt_model, "wb") as f:
         f.write(engine_bytes)
-    logging.info("Succesfully convert onnx to trt...")
+    log.info("successfully_converted_onnx_to_trt")
 
 
-def get_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
+app = typer.Typer(help="Export a pre-trained ZipVoice model from PyTorch to TensorRT.", add_completion=False)
 
-    parser.add_argument(
-        "--tensorrt-model-dir",
-        type=str,
-        default="exp",
-        help="Dir to the exported models",
-    )
-
-    parser.add_argument(
-        "--model-name",
-        type=str,
-        default="zipvoice",
-        choices=["zipvoice", "zipvoice_distill"],
-        help="The model used for inference",
-    )
-
-    parser.add_argument(
-        "--model-dir",
-        type=str,
-        default=None,
-        help="The model directory that contains model checkpoint, configuration "
-        "file model.json, and tokens file tokens.txt. Will download pre-trained "
-        "checkpoint from huggingface if not specified.",
-    )
-
-    parser.add_argument(
-        "--checkpoint-name",
-        type=str,
-        default="model.pt",
-        help="The name of model checkpoint.",
-    )
-
-    parser.add_argument(
-        "--trt-engine-file-name",
-        type=str,
-        default=None,
-        help="The name of TensorRT engine file.",
-    )
-
-    parser.add_argument(
-        "--max-batch-size",
-        type=int,
-        default=4,
-        help="The maximum batch size to use for TensorRT.",
-    )
-
-    return parser
 
 def export_onnx_fm_decoder(
     model: torch.nn.Module,
@@ -249,14 +218,14 @@ def export_onnx_fm_decoder(
 
     Args:
       model:
-        The input model
+        The input model.
       filename:
         The filename to save the exported ONNX model.
       opset_version:
         The opset version to use.
+      distill:
+        Whether the model is a distilled model.
     """
-
-
     feat_dim, seq_len = model.feat_dim, 200
 
     t = torch.tensor(0.5, dtype=torch.float32).unsqueeze(0)
@@ -265,23 +234,23 @@ def export_onnx_fm_decoder(
     x = torch.randn(1, seq_len, feat_dim, dtype=torch.float32)
     text_condition = torch.randn(1, seq_len, feat_dim, dtype=torch.float32)
     speech_condition = torch.randn(1, seq_len, feat_dim, dtype=torch.float32)
-    xt= torch.cat([x, text_condition, speech_condition], dim=2)
+    xt = torch.cat([x, text_condition, speech_condition], dim=2)
     xt = xt.repeat(2, 1, 1)
     t = t.repeat(2)
     padding_mask = padding_mask.repeat(2, 1)
     guidance_scale = guidance_scale.repeat(2)
 
     inputs_tensors = [xt, t, padding_mask]
-    input_names = ['x', 't', 'padding_mask']
+    input_names = ["x", "t", "padding_mask"]
     dynamic_axes = {
-        'x': {0: 'N', 1: 'T'},
-        't': {0: 'N'},
-        'padding_mask': {0: 'N', 1: 'T'},
+        "x": {0: "N", 1: "T"},
+        "t": {0: "N"},
+        "padding_mask": {0: "N", 1: "T"},
     }
     if distill:
         inputs_tensors.append(guidance_scale)
-        input_names.append('guidance_scale')
-        dynamic_axes['guidance_scale'] = {0: 'N'}
+        input_names.append("guidance_scale")
+        dynamic_axes["guidance_scale"] = {0: "N"}
     estimator = model.fm_decoder
     estimator = torch.jit.trace(estimator, inputs_tensors)
     torch.onnx.export(
@@ -290,38 +259,71 @@ def export_onnx_fm_decoder(
         filename,
         opset_version=opset_version,
         input_names=input_names,
-        output_names=['v'],
+        output_names=["v"],
         dynamic_axes=dynamic_axes,
         dynamo=False,
     )
-    logging.info(f"Exported to {filename}")
+    log.info("exported", filename=str(filename))
 
 
+@app.command()
 @torch.no_grad()
-def main():
-    parser = get_parser()
-    args = parser.parse_args()
-
+def main(  # noqa: PLR0913
+    tensorrt_model_dir: str = typer.Option(  # noqa: B008
+        "exp", "--tensorrt-model-dir", help="Dir to the exported models"
+    ),
+    model_name: str = typer.Option(  # noqa: B008
+        "zipvoice", "--model-name", help="The model used for inference"
+    ),
+    model_dir: str = typer.Option(  # noqa: B008
+        None,
+        "--model-dir",
+        help="The model directory that contains model checkpoint, configuration "
+        "file model.json, and tokens file tokens.txt. Will download pre-trained "
+        "checkpoint from huggingface if not specified.",
+    ),
+    checkpoint_name: str = typer.Option(  # noqa: B008
+        "model.pt", "--checkpoint-name", help="The name of model checkpoint."
+    ),
+    trt_engine_file_name: str = typer.Option(  # noqa: B008
+        None, "--trt-engine-file-name", help="The name of TensorRT engine file."
+    ),
+    max_batch_size: int = typer.Option(  # noqa: B008
+        4, "--max-batch-size", help="The maximum batch size to use for TensorRT."
+    ),
+) -> None:
+    """Export a ZipVoice model to TensorRT engine format."""
     params = AttributeDict()
-    params.update(vars(args))
+    params.update(
+        {
+            "tensorrt_model_dir": tensorrt_model_dir,
+            "model_name": model_name,
+            "model_dir": model_dir,
+            "checkpoint_name": checkpoint_name,
+            "trt_engine_file_name": trt_engine_file_name,
+            "max_batch_size": max_batch_size,
+        }
+    )
 
     params.model_dir = Path(params.model_dir)
     if not params.model_dir.is_dir():
-        raise FileNotFoundError(f"{params.model_dir} does not exist")
+        msg = f"{params.model_dir} does not exist"
+        raise FileNotFoundError(msg)
     for filename in [params.checkpoint_name, "model.json", "tokens.txt"]:
         if not (params.model_dir / filename).is_file():
-            raise FileNotFoundError(f"{params.model_dir / filename} does not exist")
+            msg = f"{params.model_dir / filename} does not exist"
+            raise FileNotFoundError(msg)
     model_ckpt = params.model_dir / params.checkpoint_name
     model_config = params.model_dir / "model.json"
     token_file = params.model_dir / "tokens.txt"
 
-    logging.info(f"Loading model from {params.model_dir}")
+    log.info("loading_model", model_dir=str(params.model_dir))
 
     tokenizer = SimpleTokenizer(token_file)
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
 
-    with open(model_config, "r") as f:
-        model_config = json.load(f)
+    with open(model_config, "rb") as f:
+        model_config = orjson.loads(f.read())
 
     if params.model_name == "zipvoice":
         model = ZipVoice(
@@ -330,7 +332,9 @@ def main():
         )
         distill = False
     else:
-        assert params.model_name == "zipvoice_distill"
+        if params.model_name != "zipvoice_distill":
+            msg = f"Unsupported model name: {params.model_name}"
+            raise ValueError(msg)
         model = ZipVoiceDistill(
             **model_config["model"],
             **tokenizer_config,
@@ -342,7 +346,8 @@ def main():
     elif str(model_ckpt).endswith(".pt"):
         load_checkpoint(filename=model_ckpt, model=model, strict=True)
     else:
-        raise NotImplementedError(f"Unsupported model checkpoint format: {model_ckpt}")
+        msg = f"Unsupported model checkpoint format: {model_ckpt}"
+        raise ValueError(msg)
 
     device = torch.device("cpu")
     model = model.to(device)
@@ -350,11 +355,10 @@ def main():
 
     convert_scaled_to_non_scaled(model, inplace=True, is_onnx=True)
 
-    logging.info("Exporting model")
+    log.info("exporting_model")
     tensorrt_model_dir = Path(params.tensorrt_model_dir)
     tensorrt_model_dir.mkdir(parents=True, exist_ok=True)
     opset_version = 18
-
 
     fm_decoder_onnx_file = tensorrt_model_dir / "fm_decoder.onnx"
 
@@ -365,18 +369,18 @@ def main():
         distill=distill,
     )
 
-    logging.info("Exported to TensorRT model")
+    log.info("exported_to_tensorrt")
 
-    trt_engine_file = f'{str(tensorrt_model_dir)}/{params.trt_engine_file_name}'
+    trt_engine_file = f"{str(tensorrt_model_dir)}/{params.trt_engine_file_name}"
     trt_kwargs = get_trt_kwargs_dynamic_batch(min_batch_size=1, opt_batch_size=2, max_batch_size=params.max_batch_size)
     convert_onnx_to_trt(trt_engine_file, trt_kwargs, fm_decoder_onnx_file, dtype=torch.float16)
 
-    logging.info("Done!")
+    log.info("done")
 
 
 if __name__ == "__main__":
-
-    formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
-    logging.basicConfig(format=formatter, level=logging.INFO, force=True)
     import tensorrt as trt
-    main()
+
+    app()
+
+# end zipvoice/bin/tensorrt_export.py

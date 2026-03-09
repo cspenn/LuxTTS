@@ -1,4 +1,5 @@
-from typing import List
+# start zipvoice/utils/infer.py
+"""Audio inference utilities for chunking, batching, and cross-fade merging."""
 
 import numpy as np
 import torch
@@ -8,20 +9,26 @@ from pydub.silence import detect_leading_silence, split_on_silence
 
 punctuation = {";", ":", ",", ".", "!", "?", "；", "：", "，", "。", "！", "？"}
 
+# Named constants replacing magic numbers
+SILENCE_THRESHOLD_MS = 1000
+SILENCE_THRESHOLD_DB = -50
+AUDIO_NORM_FACTOR = 32768.0
+AUDIO_MAX_INT16 = 32767
 
-def chunk_tokens_punctuation(tokens_list: List[str], max_tokens: int = 100):
-    """
-    Splits the input tokens list into chunks according to punctuations,
-        each with a maximum number of tokens.
+
+def chunk_tokens_punctuation(tokens_list: list[str], max_tokens: int = 100):
+    """Split tokens into chunks at punctuation boundaries.
+
+    Splits the token list at punctuation marks, then merges short chunks until
+    each chunk contains at most ``max_tokens`` tokens.
 
     Args:
-        token_list (list of str): The list of tokens to be split.
-        max_tokens (int): The maximum number of tokens per chunk.
+        tokens_list: The list of tokens to be split.
+        max_tokens: Maximum number of tokens per chunk.
 
     Returns:
-        List[str]: A list of text chunks.
+        A list of token-list chunks.
     """
-
     # 1. Split the tokens according to punctuations.
     sentences = []
     current_sentence = []
@@ -29,9 +36,7 @@ def chunk_tokens_punctuation(tokens_list: List[str], max_tokens: int = 100):
         # If the first token of current sentence is punctuation or blank,
         # append it to the end of the previous sentence.
         if (
-            len(current_sentence) == 0
-            and len(sentences) != 0
-            and (token in punctuation or token == " ")
+            len(current_sentence) == 0 and len(sentences) != 0 and (token in punctuation or token == " ")  # noqa: S105
         ):
             sentences[-1].append(token)
         # Otherwise, append the current token to the current sentence.
@@ -62,24 +67,24 @@ def chunk_tokens_punctuation(tokens_list: List[str], max_tokens: int = 100):
     return chunks
 
 
-def chunk_tokens_dialog(tokens_list: List[str], max_tokens: int = 100):
-    """
-    Splits the input tokens list into chunks according to speaker-turn
-        symbol [S1], each with a maximum number of tokens.
+def chunk_tokens_dialog(tokens_list: list[str], max_tokens: int = 100):
+    """Split dialog tokens into chunks at speaker-turn boundaries.
+
+    Splits the token list at ``[S1]`` speaker-turn markers, then merges short
+    dialog turns until each chunk contains at most ``max_tokens`` tokens.
 
     Args:
-        token_list (list of str): The list of tokens to be split.
-        max_tokens (int): The maximum number of tokens per chunk.
+        tokens_list: The list of tokens to be split.
+        max_tokens: Maximum number of tokens per chunk.
 
     Returns:
-        List[str]: A list of text chunks.
+        A list of token-list chunks.
     """
-
     # 1. Split the tokens according to speaker-turn symbol [S1].
     dialogs = []
     current_dialog = []
     for token in tokens_list:
-        if token == "[S1]":
+        if token == "[S1]":  # noqa: S105
             if len(current_dialog) != 0:
                 dialogs.append(current_dialog)
             current_dialog = []
@@ -106,27 +111,30 @@ def chunk_tokens_dialog(tokens_list: List[str], max_tokens: int = 100):
 
 
 def batchify_tokens(
-    tokens_list: List[List[int]],
+    tokens_list: list[list[int]],
     max_duration: float,
     prompt_duration: float,
     token_duration: float,
 ):
-    """
-    Sort and group the input list of token sequences into batches, where each batch's
-        total duration does not exceed the maximum.
+    """Sort and group token sequences into duration-limited batches.
+
+    Sequences are first sorted by length to minimise padding, then greedily
+    grouped so that each batch's estimated audio duration stays within
+    ``max_duration``.
 
     Args:
-        tokens_list (List[List[int]]): A list of token sequences, where each inner
-            list represents a sequence of tokens.
-        max_duration (float): The maximum allowed total duration for each batch.
-        prompt_duration (float): The duration cost per prompt in the batch.
-        token_duration (float): The duration cost per token.
+        tokens_list: A list of token sequences to batch.
+        max_duration: Maximum allowed total duration (seconds) for each batch.
+        prompt_duration: Estimated duration cost (seconds) per prompt in a
+            batch.
+        token_duration: Estimated duration (seconds) contributed by each
+            individual token.
 
     Returns:
-        batches: List[List[List[int]]]: A list of batches, where each batch is a list of
-            token sequences that fit within the max duration.
-        index: List[int]: The original index of each sentence, used to recover the
-            sequential order in the future.
+        A tuple ``(batches, index)`` where ``batches`` is a list of batches
+        (each batch is a list of token sequences) and ``index`` is the list of
+        original positions of each sequence, used to restore sequential order
+        after parallel generation.
     """
     # Create index for each sentence
     indexed_tokens = list(enumerate(tokens_list))
@@ -134,9 +142,7 @@ def batchify_tokens(
     # Sort according to sentence length (for less padding)
     indexed_sorted_tokens = sorted(indexed_tokens, key=lambda x: len(x[1]))
     index = [indexed_sorted_tokens[i][0] for i in range(len(indexed_sorted_tokens))]
-    sorted_tokens = [
-        indexed_sorted_tokens[i][1] for i in range(len(indexed_sorted_tokens))
-    ]
+    sorted_tokens = [indexed_sorted_tokens[i][1] for i in range(len(indexed_sorted_tokens))]
 
     batches = []
     batch = []
@@ -146,12 +152,7 @@ def batchify_tokens(
         # Calculate if adding current token sequence would exceed max duration
         # Formula considers: existing tokens' duration + existing
         # prompts' duration + new tokens' duration
-        if (
-            batch_size * token_duration
-            + len(batch) * prompt_duration
-            + len(tokens) * token_duration
-            <= max_duration
-        ):
+        if batch_size * token_duration + len(batch) * prompt_duration + len(tokens) * token_duration <= max_duration:
             # Add to current batch if within duration limit
             batch.append(tokens)
             batch_size += len(tokens)
@@ -170,11 +171,8 @@ def batchify_tokens(
     return batches, index
 
 
-def cross_fade_concat(
-    chunks: List[torch.Tensor], fade_duration: float = 0.1, sample_rate: int = 24000
-) -> torch.Tensor:
-    """
-    Concatenates audio chunks with cross-fading between consecutive chunks.
+def cross_fade_concat(chunks: list[torch.Tensor], fade_duration: float = 0.1, sample_rate: int = 24000) -> torch.Tensor:
+    """Concatenates audio chunks with cross-fading between consecutive chunks.
 
     Args:
         chunks: List of audio tensors, each with shape (C, T) where
@@ -219,8 +217,7 @@ def cross_fade_concat(
         final = torch.cat(
             [
                 final[..., :-k],  # All samples except last k from previous
-                final[..., -k:] * fade
-                + next_chunk[..., :k] * (1 - fade),  # Cross-fade region
+                final[..., -k:] * fade + next_chunk[..., :k] * (1 - fade),  # Cross-fade region
                 next_chunk[..., k:],  # All samples except first k from next
             ],
             dim=-1,
@@ -230,7 +227,7 @@ def cross_fade_concat(
 
 
 def add_punctuation(text: str):
-    """Add punctuation if there is not in the end of text"""
+    """Append a period to ``text`` if it does not already end with punctuation."""
     text = text.strip()
     if text[-1] not in punctuation:
         text += "."
@@ -238,39 +235,37 @@ def add_punctuation(text: str):
 
 
 def load_prompt_wav(prompt_wav: str, sampling_rate: int):
-    """
-    Load the waveform with torchaudio and resampling if needed.
+    """Load a waveform from disk and resample to the target rate if needed.
 
-    Parameters:
-        prompt_wav: path of the prompt wav.
-        sampling_rate: target sampling rate.
+    Args:
+        prompt_wav: Path to the prompt audio file.
+        sampling_rate: Target sample rate in Hz.
 
     Returns:
-        Loaded prompt waveform with target sampling rate,
-        PyTorch tensor of shape (C, T)
+        Audio tensor of shape (C, T) at the requested sample rate.
     """
     prompt_wav, prompt_sampling_rate = torchaudio.load(prompt_wav)
 
     if prompt_sampling_rate != sampling_rate:
-        resampler = torchaudio.transforms.Resample(
-            orig_freq=prompt_sampling_rate, new_freq=sampling_rate
-        )
+        resampler = torchaudio.transforms.Resample(orig_freq=prompt_sampling_rate, new_freq=sampling_rate)
         prompt_wav = resampler(prompt_wav)
     return prompt_wav
 
 
 def rms_norm(prompt_wav: torch.Tensor, target_rms: float):
-    """
-    Normalize the rms of prompt_wav is it is smaller than target rms.
+    """Normalise a waveform's RMS level up to ``target_rms`` if it is below it.
 
-    Parameters:
-        prompt_wav: PyTorch tensor with shape (C, T).
-        target_rms: target rms value
+    The waveform is only scaled upward; waveforms louder than ``target_rms``
+    are returned unchanged.
+
+    Args:
+        prompt_wav: Audio tensor of shape (C, T).
+        target_rms: Target RMS amplitude level.
 
     Returns:
-        prompt_wav: normalized prompt wav with shape (C, T).
-        promt_rms: rms of original prompt wav. Will be used to
-            re-normalize the generated wav.
+        A tuple ``(normalised_wav, original_rms)`` where ``normalised_wav``
+        has shape (C, T) and ``original_rms`` is the RMS of the input before
+        normalisation (used to restore output volume).
     """
     prompt_rms = torch.sqrt(torch.mean(torch.square(prompt_wav)))
     if prompt_rms < target_rms:
@@ -284,18 +279,22 @@ def remove_silence(
     only_edge: bool = False,
     trail_sil: float = 0,
 ):
-    """
-    Remove silences longer than 1 second, and edge silences longer than 0.1 seconds
+    """Remove silence from a waveform tensor.
 
-    Parameters:
-        audio: PyTorch tensor with shape (C, T).
-        sampling_rate: sampling rate of the audio.
-        only_edge: If true, only remove edge silences.
-        trail_sil: the duration of added trailing silence in ms.
+    By default, removes interior silences longer than 1 second and edge
+    silences longer than 0.1 seconds.  When ``only_edge`` is ``True``, only
+    edge silences are removed.
+
+    Args:
+        audio: Audio tensor of shape (C, T).
+        sampling_rate: Sample rate of the audio in Hz.
+        only_edge: If ``True``, skip interior silence removal and only trim
+            leading and trailing silence.
+        trail_sil: Duration in milliseconds of silence to append after
+            trimming.
 
     Returns:
-        PyTorch tensor with shape (C, T), where C is number of channels
-            and T is number of audio samples
+        Processed audio tensor of shape (C, T').
     """
     # Load audio file
     wave = tensor_to_audiosegment(audio, sampling_rate)
@@ -304,9 +303,9 @@ def remove_silence(
         # Split audio using silences longer than 1 second
         non_silent_segs = split_on_silence(
             wave,
-            min_silence_len=1000,  # Silences longer than 1 second (1000ms)
-            silence_thresh=-50,
-            keep_silence=1000,  # Keep 1.0 second of silence around segments
+            min_silence_len=SILENCE_THRESHOLD_MS,  # Silences longer than 1 second (1000ms)
+            silence_thresh=SILENCE_THRESHOLD_DB,
+            keep_silence=SILENCE_THRESHOLD_MS,  # Keep 1.0 second of silence around segments
             seek_step=10,
         )
 
@@ -316,7 +315,7 @@ def remove_silence(
             wave += seg
 
     # Remove silence longer than 0.1 seconds in the begining and ending of wave
-    wave = remove_silence_edges(wave, 100, -50)
+    wave = remove_silence_edges(wave, 100, SILENCE_THRESHOLD_DB)
 
     # Add trailing silence to avoid leaking prompt to generated speech.
     wave = wave + AudioSegment.silent(duration=trail_sil)
@@ -325,20 +324,19 @@ def remove_silence(
     return audiosegment_to_tensor(wave)
 
 
-def remove_silence_edges(
-    audio: AudioSegment, keep_silence: int = 100, silence_threshold: float = -50
-):
-    """
-    Remove edge silences longer than `keep_silence` ms.
+def remove_silence_edges(audio: AudioSegment, keep_silence: int = 100, silence_threshold: float = SILENCE_THRESHOLD_DB):
+    """Trim leading and trailing silence from an AudioSegment.
 
-    Parameters:
-        audio: an AudioSegment object.
-        keep_silence: kept silence in the edge.
-        only_edge: If true, only remove edge silences.
-        silence_threshold: the threshold of silence.
+    Args:
+        audio: The AudioSegment to trim.
+        keep_silence: Milliseconds of silence to retain at each edge after
+            trimming.
+        silence_threshold: dBFS threshold below which audio is considered
+            silent.
 
     Returns:
-        An AudioSegment object
+        Trimmed AudioSegment with at most ``keep_silence`` ms of silence at
+        each edge.
     """
     # Remove leading silence
     start_idx = detect_leading_silence(audio, silence_threshold=silence_threshold)
@@ -356,13 +354,19 @@ def remove_silence_edges(
 
 
 def audiosegment_to_tensor(aseg):
-    """
-    Convert a pydub.AudioSegment to PyTorch audio tensor
+    """Convert a pydub AudioSegment to a PyTorch audio tensor.
+
+    Args:
+        aseg: The AudioSegment to convert.
+
+    Returns:
+        Float32 tensor of shape (1, T) for mono or (C, T) for multi-channel
+        audio, with values normalised to the range [-1, 1].
     """
     audio_data = np.array(aseg.get_array_of_samples())
 
     # Convert to float32 and normalize to [-1, 1] range
-    audio_data = audio_data.astype(np.float32) / 32768.0
+    audio_data = audio_data.astype(np.float32) / AUDIO_NORM_FACTOR
 
     # Handle channels
     if aseg.channels == 1:
@@ -376,13 +380,15 @@ def audiosegment_to_tensor(aseg):
 
 
 def tensor_to_audiosegment(tensor, sample_rate):
-    """
-    Convert a PyTorch audio tensor to pydub.AudioSegment
+    """Convert a PyTorch audio tensor to a pydub AudioSegment.
 
-    Parameters:
-        tensor: Tensor with shape (C, T), where C is the number of channels
-            and T is the time steps
-        sample_rate: Audio sample rate
+    Args:
+        tensor: Float32 tensor of shape (C, T) with values in [-1, 1], where
+            C is the number of channels and T is the number of samples.
+        sample_rate: Audio sample rate in Hz.
+
+    Returns:
+        AudioSegment with 16-bit PCM encoding at the given sample rate.
     """
     # Convert tensor to numpy array
     audio_np = tensor.cpu().numpy()
@@ -393,7 +399,7 @@ def tensor_to_audiosegment(tensor, sample_rate):
 
     # Convert to int16 type (common format for pydub)
     # Assumes tensor values are in [-1, 1] range as floating point
-    audio_np = (audio_np * 32768.0).clip(-32768, 32767).astype(np.int16)
+    audio_np = (audio_np * AUDIO_NORM_FACTOR).clip(-AUDIO_NORM_FACTOR, AUDIO_MAX_INT16).astype(np.int16)
 
     # Convert to byte stream
     # For multi-channel audio, pydub requires interleaved format
@@ -412,3 +418,49 @@ def tensor_to_audiosegment(tensor, sample_rate):
     )
 
     return audio_segment
+
+
+def merge_chunked_wavs(
+    chunked_wavs: list[torch.Tensor],
+    chunked_index: list[int] | None = None,
+    remove_long_sil: bool = False,
+    sampling_rate: int = 24000,
+) -> torch.Tensor:
+    """Merge a list of chunked audio tensors into a single waveform.
+
+    When chunks were produced by a batching step that reordered them (e.g.,
+    ``batchify_tokens``), pass the corresponding ``chunked_index`` so the
+    chunks are sorted back into their original sequential order before
+    concatenation.  When chunks were produced in sequential order (no
+    reordering), leave ``chunked_index`` as ``None``.
+
+    After reordering, chunks are joined with a 0.1-second cross-fade via
+    ``cross_fade_concat``, and edge silences (plus, optionally, long interior
+    silences) are removed via ``remove_silence``.
+
+    Args:
+        chunked_wavs: List of audio tensors, each with shape (C, T).
+        chunked_index: Original sequential indices corresponding to each
+            element of ``chunked_wavs``, as returned by ``batchify_tokens``.
+            When ``None``, ``chunked_wavs`` is treated as already in order.
+        remove_long_sil: If ``True``, also remove long silences in the
+            interior of the merged audio (edge silences are always removed).
+        sampling_rate: Audio sample rate in Hz.
+
+    Returns:
+        A single merged audio tensor with shape (C, T_total).
+    """
+    if chunked_index is not None:
+        # Restore the original sequential order that was shuffled by batchify_tokens
+        indexed_chunked_wavs = list(zip(chunked_index, chunked_wavs, strict=False))
+        indexed_chunked_wavs.sort(key=lambda x: x[0])
+        sequential_chunked_wavs = [wav for _, wav in indexed_chunked_wavs]
+    else:
+        sequential_chunked_wavs = chunked_wavs
+
+    final_wav = cross_fade_concat(sequential_chunked_wavs, fade_duration=0.1, sample_rate=sampling_rate)
+    final_wav = remove_silence(final_wav, sampling_rate, only_edge=(not remove_long_sil), trail_sil=0)
+    return final_wav
+
+
+# end zipvoice/utils/infer.py

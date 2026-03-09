@@ -1,3 +1,4 @@
+# start zipvoice/utils/scaling_converter.py
 # Copyright    2022-2023  Xiaomi Corp.        (authors: Fangjun Kuang,
 #                                                       Zengwei Yao)
 #
@@ -15,15 +16,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-This file replaces various modules in a model.
+"""Utilities to replace scaled modules with non-scaled equivalents for export.
+
 Specifically, ActivationBalancer is replaced with an identity operator;
 Whiten is also replaced with an identity operator;
 BasicNorm is replaced by a module with `exp` removed.
 """
 
 import copy
-from typing import List
 
 import torch
 import torch.nn as nn
@@ -42,39 +42,52 @@ from zipvoice.models.modules.zipformer import CompactRelPositionalEncoding
 
 # Copied from https://pytorch.org/docs/1.9.0/_modules/torch/nn/modules/module.html#Module.get_submodule  # noqa
 # get_submodule was added to nn.Module at v1.9.0
-def get_submodule(model, target):
+def get_submodule(model, target):  # noqa: ANN001, ANN201
+    """Return the submodule of ``model`` at the dotted ``target`` path.
+
+    Args:
+        model: The root ``nn.Module``.
+        target: Dot-separated path to the submodule (e.g. ``"encoder.layers.0"``).
+
+    Returns:
+        The ``nn.Module`` at the specified path.
+
+    Raises:
+        AttributeError: If any component of the path is missing or is not an
+            ``nn.Module``.
+    """
     if target == "":
         return model
-    atoms: List[str] = target.split(".")
+    atoms: list[str] = target.split(".")
     mod: torch.nn.Module = model
     for item in atoms:
         if not hasattr(mod, item):
-            raise AttributeError(
-                mod._get_name() + " has no " "attribute `" + item + "`"
-            )
+            raise AttributeError(mod._get_name() + " has no attribute `" + item + "`")
         mod = getattr(mod, item)
         if not isinstance(mod, torch.nn.Module):
-            raise AttributeError("`" + item + "` is not " "an nn.Module")
+            raise TypeError("`" + item + "` is not an nn.Module")
     return mod
 
 
 def convert_scaled_to_non_scaled(
     model: nn.Module,
     inplace: bool = False,
-    is_pnnx: bool = False,
+    _is_pnnx: bool = False,
     is_onnx: bool = False,
 ):
-    """
+    """Convert a model's scaled layers to non-scaled equivalents for export.
+
     Args:
       model:
         The model to be converted.
       inplace:
         If True, the input model is modified inplace.
         If False, the input model is copied and we modify the copied version.
-      is_pnnx:
-        True if we are going to export the model for PNNX.
+      _is_pnnx:
+        True if we are going to export the model for PNNX (currently unused).
       is_onnx:
         True if we are going to export the model for ONNX.
+
     Return:
       Return a model without scaled layers.
     """
@@ -103,3 +116,6 @@ def convert_scaled_to_non_scaled(
             setattr(model, k, v)
 
     return model
+
+
+# end zipvoice/utils/scaling_converter.py

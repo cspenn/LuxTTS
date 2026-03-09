@@ -1,3 +1,4 @@
+# start zipvoice/bin/onnx_export.py
 #!/usr/bin/env python3
 # Copyright         2025  Xiaomi Corp.        (authors: Zengwei Yao)
 #
@@ -15,9 +16,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-This script exports a pre-trained ZipVoice or ZipVoice-Distill model from PyTorch to
-ONNX.
+"""Export a pre-trained ZipVoice or ZipVoice-Distill model from PyTorch to ONNX.
+
+This script exports the model from PyTorch to ONNX format.
 
 Usage:
 
@@ -31,16 +32,14 @@ python3 -m zipvoice.bin.onnx_export \
     which are the models before and after distillation, respectively.
 """
 
-
-import argparse
-import json
-import logging
 from pathlib import Path
-from typing import Dict
 
 import onnx
+import orjson
 import safetensors.torch
+import structlog
 import torch
+import typer
 from onnxruntime.quantization import QuantType, quantize_dynamic
 from torch import Tensor, nn
 
@@ -51,47 +50,13 @@ from zipvoice.utils.checkpoint import load_checkpoint
 from zipvoice.utils.common import AttributeDict
 from zipvoice.utils.scaling_converter import convert_scaled_to_non_scaled
 
-
-def get_parser():
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
-    parser.add_argument(
-        "--onnx-model-dir",
-        type=str,
-        default="exp",
-        help="Dir to the exported models",
-    )
-
-    parser.add_argument(
-        "--model-name",
-        type=str,
-        default="zipvoice",
-        choices=["zipvoice", "zipvoice_distill"],
-        help="The model used for inference",
-    )
-
-    parser.add_argument(
-        "--model-dir",
-        type=str,
-        default=None,
-        help="The model directory that contains model checkpoint, configuration "
-        "file model.json, and tokens file tokens.txt. Will download pre-trained "
-        "checkpoint from huggingface if not specified.",
-    )
-
-    parser.add_argument(
-        "--checkpoint-name",
-        type=str,
-        default="model.pt",
-        help="The name of model checkpoint.",
-    )
-
-    return parser
+log = structlog.get_logger()
 
 
-def add_meta_data(filename: str, meta_data: Dict[str, str]):
+app = typer.Typer(help="Export a pre-trained ZipVoice model from PyTorch to ONNX.", add_completion=False)
+
+
+def add_meta_data(filename: str, meta_data: dict[str, str]):
     """Add meta data to an ONNX model. It is changed in-place.
 
     Args:
@@ -110,8 +75,14 @@ def add_meta_data(filename: str, meta_data: Dict[str, str]):
 
 
 class OnnxTextModel(nn.Module):
+    """A wrapper for ZipVoice text encoder for ONNX export."""
+
     def __init__(self, model: nn.Module):
-        """A wrapper for ZipVoice text encoder."""
+        """Initialize with the ZipVoice text encoder components.
+
+        Args:
+            model: The ZipVoice model to extract the text encoder from.
+        """
         super().__init__()
         self.embed = model.embed
         self.text_encoder = model.text_encoder
@@ -124,6 +95,17 @@ class OnnxTextModel(nn.Module):
         prompt_features_len: Tensor,
         speed: Tensor,
     ) -> Tensor:
+        """Run the text encoder forward pass.
+
+        Args:
+            tokens: Text token tensor.
+            prompt_tokens: Prompt text token tensor.
+            prompt_features_len: Length of prompt features.
+            speed: Speed control tensor.
+
+        Returns:
+            Text condition tensor.
+        """
         cat_tokens = torch.cat([prompt_tokens, tokens], dim=1)
         cat_tokens = nn.functional.pad(cat_tokens, (0, 1), value=self.pad_id)
         tokens_len = cat_tokens.shape[1] - 1
@@ -132,13 +114,11 @@ class OnnxTextModel(nn.Module):
         embed = self.embed(cat_tokens)
         embed = self.text_encoder(x=embed, t=None, padding_mask=padding_mask)
 
-        features_len = torch.ceil(
-            (prompt_features_len / prompt_tokens.shape[1] * tokens_len / speed)
-        ).to(dtype=torch.int64)
-
-        token_dur = torch.div(features_len, tokens_len, rounding_mode="floor").to(
+        features_len = torch.ceil(prompt_features_len / prompt_tokens.shape[1] * tokens_len / speed).to(
             dtype=torch.int64
         )
+
+        token_dur = torch.div(features_len, tokens_len, rounding_mode="floor").to(dtype=torch.int64)
 
         # If you pass a scalar tensor, ONNX may infer the shape as [1] (rank-1 tensor),
         # but sometimes expects an actual scalar (rank-0).
@@ -167,12 +147,19 @@ class OnnxTextModel(nn.Module):
 
 
 class OnnxFlowMatchingModel(nn.Module):
+    """A wrapper for ZipVoice flow-matching decoder for ONNX export."""
+
     def __init__(self, model: nn.Module, distill: bool = False):
-        """A wrapper for ZipVoice flow-matching decoder."""
+        """Initialize with the ZipVoice flow-matching decoder components.
+
+        Args:
+            model: The ZipVoice model to extract the FM decoder from.
+            distill: Whether the model is a distilled model.
+        """
         super().__init__()
         self.distill = distill
         self.fm_decoder = model.fm_decoder
-        self.model_func = getattr(model, "forward_fm_decoder")
+        self.model_func = model.forward_fm_decoder
         self.feat_dim = model.feat_dim
 
     def forward(
@@ -183,6 +170,18 @@ class OnnxFlowMatchingModel(nn.Module):
         speech_condition: torch.Tensor,
         guidance_scale: Tensor,
     ) -> Tensor:
+        """Run the flow-matching decoder forward pass.
+
+        Args:
+            t: Current timestep tensor.
+            x: Current noisy features tensor.
+            text_condition: Text conditioning tensor.
+            speech_condition: Speech conditioning tensor.
+            guidance_scale: Classifier-free guidance scale tensor.
+
+        Returns:
+            Predicted velocity tensor.
+        """
         if self.distill:
             return self.model_func(
                 t=t,
@@ -193,14 +192,10 @@ class OnnxFlowMatchingModel(nn.Module):
             )
         else:
             x = x.repeat(2, 1, 1)
-            text_condition = torch.cat(
-                [torch.zeros_like(text_condition), text_condition], dim=0
-            )
+            text_condition = torch.cat([torch.zeros_like(text_condition), text_condition], dim=0)
             speech_condition = torch.cat(
                 [
-                    torch.where(
-                        t > 0.5, torch.zeros_like(speech_condition), speech_condition
-                    ),
+                    torch.where(t > 0.5, torch.zeros_like(speech_condition), speech_condition),
                     speech_condition,
                 ],
                 dim=0,
@@ -260,10 +255,10 @@ def export_text_encoder(
         "use_espeak": "1",
         "use_pinyin": "1",
     }
-    logging.info(f"meta_data: {meta_data}")
+    log.info("meta_data", meta_data=meta_data)
     add_meta_data(filename=filename, meta_data=meta_data)
 
-    logging.info(f"Exported to {filename}")
+    log.info("exported", filename=str(filename))
 
 
 def export_fm_decoder(
@@ -289,9 +284,7 @@ def export_fm_decoder(
     speech_condition = torch.randn(1, seq_len, feat_dim, dtype=torch.float32)
     guidance_scale = torch.tensor(1.0, dtype=torch.float32)
 
-    model = torch.jit.trace(
-        model, (t, x, text_condition, speech_condition, guidance_scale)
-    )
+    model = torch.jit.trace(model, (t, x, text_condition, speech_condition, guidance_scale))
 
     torch.onnx.export(
         model,
@@ -320,37 +313,62 @@ def export_fm_decoder(
         "window_length": "1024",
         "num_mels": "100",
     }
-    logging.info(f"meta_data: {meta_data}")
+    log.info("meta_data", meta_data=meta_data)
     add_meta_data(filename=filename, meta_data=meta_data)
 
-    logging.info(f"Exported to {filename}")
+    log.info("exported", filename=str(filename))
 
 
+@app.command()
 @torch.no_grad()
-def main():
-    parser = get_parser()
-    args = parser.parse_args()
-
+def main(  # noqa: PLR0915
+    onnx_model_dir: str = typer.Option(  # noqa: B008
+        "exp", "--onnx-model-dir", help="Dir to the exported models"
+    ),
+    model_name: str = typer.Option(  # noqa: B008
+        "zipvoice", "--model-name", help="The model used for inference"
+    ),
+    model_dir: str = typer.Option(  # noqa: B008
+        None,
+        "--model-dir",
+        help="The model directory that contains model checkpoint, configuration "
+        "file model.json, and tokens file tokens.txt. Will download pre-trained "
+        "checkpoint from huggingface if not specified.",
+    ),
+    checkpoint_name: str = typer.Option(  # noqa: B008
+        "model.pt", "--checkpoint-name", help="The name of model checkpoint."
+    ),
+) -> None:
+    """Export a ZipVoice model to ONNX format with int8 quantization."""
     params = AttributeDict()
-    params.update(vars(args))
+    params.update(
+        {
+            "onnx_model_dir": onnx_model_dir,
+            "model_name": model_name,
+            "model_dir": model_dir,
+            "checkpoint_name": checkpoint_name,
+        }
+    )
 
     params.model_dir = Path(params.model_dir)
     if not params.model_dir.is_dir():
-        raise FileNotFoundError(f"{params.model_dir} does not exist")
+        msg = f"{params.model_dir} does not exist"
+        raise FileNotFoundError(msg)
     for filename in [params.checkpoint_name, "model.json", "tokens.txt"]:
         if not (params.model_dir / filename).is_file():
-            raise FileNotFoundError(f"{params.model_dir / filename} does not exist")
+            msg = f"{params.model_dir / filename} does not exist"
+            raise FileNotFoundError(msg)
     model_ckpt = params.model_dir / params.checkpoint_name
     model_config = params.model_dir / "model.json"
     token_file = params.model_dir / "tokens.txt"
 
-    logging.info(f"Loading model from {params.model_dir}")
+    log.info("loading_model", model_dir=str(params.model_dir))
 
     tokenizer = SimpleTokenizer(token_file)
     tokenizer_config = {"vocab_size": tokenizer.vocab_size, "pad_id": tokenizer.pad_id}
 
-    with open(model_config, "r") as f:
-        model_config = json.load(f)
+    with open(model_config, "rb") as f:
+        model_config = orjson.loads(f.read())
 
     if params.model_name == "zipvoice":
         model = ZipVoice(
@@ -359,7 +377,9 @@ def main():
         )
         distill = False
     else:
-        assert params.model_name == "zipvoice_distill"
+        if params.model_name != "zipvoice_distill":
+            msg = f"Unsupported model name: {params.model_name}"
+            raise ValueError(msg)
         model = ZipVoiceDistill(
             **model_config["model"],
             **tokenizer_config,
@@ -371,7 +391,8 @@ def main():
     elif str(model_ckpt).endswith(".pt"):
         load_checkpoint(filename=model_ckpt, model=model, strict=True)
     else:
-        raise NotImplementedError(f"Unsupported model checkpoint format: {model_ckpt}")
+        msg = f"Unsupported model checkpoint format: {model_ckpt}"
+        raise ValueError(msg)
 
     device = torch.device("cpu")
     model = model.to(device)
@@ -379,7 +400,7 @@ def main():
 
     convert_scaled_to_non_scaled(model, inplace=True, is_onnx=True)
 
-    logging.info("Exporting model")
+    log.info("exporting_model")
     onnx_model_dir = Path(params.onnx_model_dir)
     onnx_model_dir.mkdir(parents=True, exist_ok=True)
     opset_version = 13
@@ -400,7 +421,7 @@ def main():
         opset_version=opset_version,
     )
 
-    logging.info("Generate int8 quantization models")
+    log.info("generating_int8_quantization_models")
 
     text_encoder_int8_file = onnx_model_dir / "text_encoder_int8.onnx"
     quantize_dynamic(
@@ -418,12 +439,10 @@ def main():
         weight_type=QuantType.QInt8,
     )
 
-    logging.info("Done!")
+    log.info("done")
 
 
 if __name__ == "__main__":
+    app()
 
-    formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
-    logging.basicConfig(format=formatter, level=logging.INFO, force=True)
-
-    main()
+# end zipvoice/bin/onnx_export.py

@@ -1,3 +1,27 @@
+# =============================================================
+# LuxTTS project-specific ignores
+# =============================================================
+
+# AI assistant guidance (machine-generated, not for contributors)
+CLAUDE.md
+
+# Dot files / directories (OS artifacts, tool configs, IDE, Claude)
+.*
+!.gitignore
+
+# Runtime output and working directories
+output/
+input/
+temp/
+*.log
+
+# Documentation (rules, reports — not needed by users)
+docs/
+
+# =============================================================
+# Python standard ignores
+# =============================================================
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
@@ -193,3 +217,6 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Project credentials and config secrets
+credentials.yml

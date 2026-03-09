@@ -1,3 +1,6 @@
+# start zipvoice/utils/lr_scheduler.py
+"""Learning rate schedulers for ZipVoice model training."""
+
 # Copyright      2022  Xiaomi Corp.        (authors: Daniel Povey)
 #
 # See ../LICENSE for clarification regarding multiple authors
@@ -14,23 +17,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
-from typing import List, Optional, Union
+from abc import ABC, abstractmethod
 
+import structlog
 import torch
 from torch.optim import Optimizer
 
+log = structlog.get_logger()
 
-class LRScheduler(object):
-    """
-    Base-class for learning rate schedulers where the learning-rate depends on both the
-    batch and the epoch.
-    """
+
+class LRScheduler(ABC):
+    """Base-class for learning rate schedulers where the learning-rate depends on both the batch and the epoch."""
 
     def __init__(self, optimizer: Optimizer, verbose: bool = False):
+        """Initialize the LRScheduler.
+
+        Args:
+            optimizer: The optimizer to schedule.
+            verbose: If True, log learning rate changes.
+        """
         # Attach optimizer
         if not isinstance(optimizer, Optimizer):
-            raise TypeError("{} is not an Optimizer".format(type(optimizer).__name__))
+            msg = f"{type(optimizer).__name__} is not an Optimizer"
+            raise TypeError(msg)
         self.optimizer = optimizer
         self.verbose = verbose
 
@@ -69,34 +78,44 @@ class LRScheduler(object):
         self.__dict__.update(state_dict)
         self.base_lrs = base_lrs
 
-    def get_last_lr(self) -> List[float]:
+    def get_last_lr(self) -> list[float]:
         """Return last computed learning rate by current scheduler.
-        Will be a list of float."""
+
+        Will be a list of float.
+        """
         return self._last_lr
 
+    @abstractmethod
     def get_lr(self):
-        # Compute list of learning rates from self.epoch and self.batch and
-        # self.base_lrs; this must be overloaded by the user.
-        # e.g. return [some_formula(self.batch, self.epoch, base_lr)
-        # for base_lr in self.base_lrs ]
-        raise NotImplementedError
+        """Compute and return the list of learning rates for all param groups.
 
-    def step_batch(self, batch: Optional[int] = None) -> None:
-        # Step the batch index, or just set it.  If `batch` is specified, it
-        # must be the batch index from the start of training, i.e. summed over
-        # all epochs.
-        # You can call this in any order; if you don't provide 'batch', it should
-        # of course be called once per batch.
+        Must be overridden by subclasses. Should use self.epoch, self.batch,
+        and self.base_lrs to calculate the current learning rates.
+        """
+        ...
+
+    def step_batch(self, batch: int | None = None) -> None:
+        """Step the batch index, or set it to the given value.
+
+        Args:
+            batch: If provided, sets the batch counter to this value (must be
+                the absolute batch index from the start of training). If None,
+                increments the counter by one.
+        """
         if batch is not None:
             self.batch = batch
         else:
             self.batch = self.batch + 1
         self._set_lrs()
 
-    def step_epoch(self, epoch: Optional[int] = None):
-        # Step the epoch index, or just set it.  If you provide the 'epoch' arg, you
-        # should call this at the start of the epoch; if you don't provide the 'epoch'
-        # arg, you should call it at the end of the epoch.
+    def step_epoch(self, epoch: int | None = None):
+        """Step the epoch index, or set it to the given value.
+
+        Args:
+            epoch: If provided, sets the epoch counter to this value and should
+                be called at the start of the epoch. If None, increments by one
+                and should be called at the end of the epoch.
+        """
         if epoch is not None:
             self.epoch = epoch
         else:
@@ -105,9 +124,11 @@ class LRScheduler(object):
 
     def _set_lrs(self):
         values = self.get_lr()
-        assert len(values) == len(self.optimizer.param_groups)
+        if len(values) != len(self.optimizer.param_groups):
+            msg = f"Expected {len(self.optimizer.param_groups)} LR values, got {len(values)}"
+            raise RuntimeError(msg)
 
-        for i, data in enumerate(zip(self.optimizer.param_groups, values)):
+        for i, data in enumerate(zip(self.optimizer.param_groups, values, strict=False)):
             param_group, lr = data
             param_group["lr"] = lr
             self.print_lr(self.verbose, i, lr)
@@ -116,15 +137,18 @@ class LRScheduler(object):
     def print_lr(self, is_verbose, group, lr):
         """Display the current learning rate."""
         if is_verbose:
-            logging.warning(
-                f"Epoch={self.epoch}, batch={self.batch}: adjusting learning rate"
-                f" of group {group} to {lr:.4e}."
+            log.warning(
+                "adjusting_lr",
+                epoch=self.epoch,
+                batch=self.batch,
+                group=group,
+                lr=f"{lr:.4e}",
             )
 
 
 class Eden(LRScheduler):
-    """
-    Eden scheduler.
+    """Eden learning rate scheduler.
+
     The basic formula (before warmup) is:
       lr = base_lr * (((batch**2 + lr_batches**2) / lr_batches**2) ** -0.25 *
                      (((epoch**2 + lr_epochs**2) / lr_epochs**2) ** -0.25)) * warmup
@@ -150,34 +174,44 @@ class Eden(LRScheduler):
               and you will do few epochs.
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         optimizer: Optimizer,
-        lr_batches: Union[int, float],
-        lr_epochs: Union[int, float],
-        warmup_batches: Union[int, float] = 500.0,
+        lr_batches: int | float,
+        lr_epochs: int | float,
+        warmup_batches: int | float = 500.0,
         warmup_start: float = 0.5,
         verbose: bool = False,
     ):
-        super(Eden, self).__init__(optimizer, verbose)
+        """Initialize the Eden scheduler.
+
+        Args:
+            optimizer: The optimizer to schedule.
+            lr_batches: Number of batches after which LR starts significantly decreasing.
+            lr_epochs: Number of epochs after which LR starts significantly decreasing.
+            warmup_batches: Number of batches over which LR warms up from warmup_start to 1.0.
+            warmup_start: Starting LR multiplier at the beginning of warmup.
+            verbose: If True, log learning rate changes.
+        """
+        super().__init__(optimizer, verbose)
         self.lr_batches = lr_batches
         self.lr_epochs = lr_epochs
         self.warmup_batches = warmup_batches
 
-        assert 0.0 <= warmup_start <= 1.0, warmup_start
+        if not (0.0 <= warmup_start <= 1.0):
+            msg = f"warmup_start must be in [0.0, 1.0], got {warmup_start}"
+            raise ValueError(msg)
         self.warmup_start = warmup_start
 
     def get_lr(self):
-        factor = (
-            (self.batch**2 + self.lr_batches**2) / self.lr_batches**2
-        ) ** -0.25 * (
+        """Compute and return learning rates for all parameter groups using the Eden formula."""
+        factor = ((self.batch**2 + self.lr_batches**2) / self.lr_batches**2) ** -0.25 * (
             ((self.epoch**2 + self.lr_epochs**2) / self.lr_epochs**2) ** -0.25
         )
         warmup_factor = (
             1.0
             if self.batch >= self.warmup_batches
-            else self.warmup_start
-            + (1.0 - self.warmup_start) * (self.batch / self.warmup_batches)
+            else self.warmup_start + (1.0 - self.warmup_start) * (self.batch / self.warmup_batches)
             # else 0.5 + 0.5 * (self.batch / self.warmup_batches)
         )
 
@@ -185,8 +219,7 @@ class Eden(LRScheduler):
 
 
 class FixedLRScheduler(LRScheduler):
-    """
-    Fixed learning rate scheduler.
+    """Fixed learning rate scheduler.
 
     Args:
         optimizer: the optimizer to change the learning rates on
@@ -197,11 +230,17 @@ class FixedLRScheduler(LRScheduler):
         optimizer: Optimizer,
         verbose: bool = False,
     ):
-        super(FixedLRScheduler, self).__init__(optimizer, verbose)
+        """Initialize the FixedLRScheduler.
+
+        Args:
+            optimizer: The optimizer to schedule.
+            verbose: If True, log learning rate changes.
+        """
+        super().__init__(optimizer, verbose)
 
     def get_lr(self):
-
-        return [x for x in self.base_lrs]
+        """Return the fixed base learning rates for all parameter groups."""
+        return list(self.base_lrs)
 
 
 def _test_eden():
@@ -215,7 +254,7 @@ def _test_eden():
     for epoch in range(10):
         scheduler.step_epoch(epoch)  # sets epoch to `epoch`
 
-        for step in range(20):
+        for _step in range(20):
             x = torch.randn(200, 100).detach()
             x.requires_grad = True
             y = m(x)
@@ -227,19 +266,20 @@ def _test_eden():
             scheduler.step_batch()
             optim.zero_grad()
 
-    logging.info(f"last lr = {scheduler.get_last_lr()}")
-    logging.info(f"state dict = {scheduler.state_dict()}")
+    log.info("last_lr", lr=scheduler.get_last_lr())
+    log.info("state_dict", state_dict=scheduler.state_dict())
 
 
 if __name__ == "__main__":
     torch.set_num_threads(1)
     torch.set_num_interop_threads(1)
-    logging.getLogger().setLevel(logging.INFO)
     import subprocess
 
-    s = subprocess.check_output(
-        "git status -uno .; git log -1; git diff HEAD .", shell=True
+    s = subprocess.check_output(  # noqa: S602
+        "git status -uno .; git log -1; git diff HEAD .",  # noqa: S607
+        shell=True,
     )
-    logging.info(s)
+    log.info("git_status", output=str(s))
 
     _test_eden()
+# end zipvoice/utils/lr_scheduler.py

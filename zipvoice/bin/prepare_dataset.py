@@ -1,3 +1,4 @@
+# start zipvoice/bin/prepare_dataset.py
 #!/usr/bin/env python3
 # Copyright         2025  Xiaomi Corp.        (authors: Han Zhu)
 #
@@ -15,8 +16,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""
-This script generates lhotse manifest files from TSV files for custom datasets.
+r"""This script generates lhotse manifest files from TSV files for custom datasets.
 
 Each line of the TSV files should be in one of the following formats:
 1. "{uniq_id}\t{text}\t{wav_path}" if the text corresponds to the full wav",
@@ -56,99 +56,61 @@ The output file would be "data/manifests/custom_cuts_dev.jsonl.gz".
 
 """
 
-import argparse
-import logging
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import List, Optional, Tuple
 
+import structlog
+import typer
 from lhotse import CutSet, validate_recordings_and_supervisions
 from lhotse.audio import Recording, RecordingSet
 from lhotse.qa import fix_manifests
 from lhotse.supervision import SupervisionSegment, SupervisionSet
 from lhotse.utils import Pathlike
-from tqdm.auto import tqdm
+from rich.progress import track
+
+log = structlog.get_logger()
 
 
-def get_args():
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument(
-        "--tsv-path",
-        type=str,
-        help="The path of the tsv file. Each line should be in the format: "
-        "{uniq_id}\t{text}\t{wav_path}\t{start_time}\t{end_time} "
-        "if text corresponds to part of the wav or {uniq_id}\t{text}\t{wav_path} "
-        "if the text corresponds to the full wav",
-    )
-    parser.add_argument(
-        "--prefix",
-        type=str,
-        default="custom",
-        help="Prefix of the output manifest file.",
-    )
-
-    parser.add_argument(
-        "--subset",
-        type=str,
-        default="train",
-        help="Subset name manifest file, typically train or dev.",
-    )
-
-    parser.add_argument(
-        "--num-jobs",
-        type=int,
-        default=20,
-        help="Number of jobs to processing.",
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="data/manifests",
-        help="The destination directory of manifest files.",
-    )
-    parser.add_argument(
-        "--sampling-rate",
-        type=int,
-        default=24000,
-        help="The target sampling rate.",
-    )
-    return parser.parse_args()
+app = typer.Typer(help="Generate lhotse manifest files from TSV files.", add_completion=False)
 
 
 def _parse_recording(
     wav_path: str,
-) -> Tuple[Recording, str]:
-    """
-    :param wav_path: Path to the audio file
-    :return: a tuple of "recording" and "recording_id"
-    """
+) -> tuple[Recording, str]:
+    """Parse an audio file into a Recording object.
 
+    Args:
+        wav_path: Path to the audio file.
+
+    Returns:
+        A tuple of "recording" and "recording_id".
+    """
     recording_id = wav_path.replace("/", "_").replace(".", "_")
     recording = Recording.from_file(path=wav_path, recording_id=recording_id)
 
     return recording, recording_id
 
 
-def _parse_supervision(
-    supervision: List, recording_dict: dict
-) -> Optional[SupervisionSegment]:
-    """
-    :param line: A line from the TSV file
-    :param recording_dict: Dictionary mapping recording IDs to Recording objects
-    :return: A SupervisionSegment object
-    """
+def _parse_supervision(supervision: list, recording_dict: dict) -> SupervisionSegment | None:
+    """Parse a supervision entry into a SupervisionSegment.
 
+    Args:
+        supervision: A list with supervision data from the TSV file.
+        recording_dict: Dictionary mapping recording IDs to Recording objects.
+
+    Returns:
+        A SupervisionSegment object, or None if parsing fails.
+    """
     uniq_id, text, wav_path, start, end = supervision
     try:
         recording_id = wav_path.replace("/", "_").replace(".", "_")
 
         recording = recording_dict[recording_id]
         duration = end - start if end is not None else recording.duration
-        assert duration <= recording.duration, f"Duration {duration} is greater than "
-        f"recording duration {recording.duration}"
+        if duration > recording.duration:
+            msg = f"Duration {duration} is greater than recording duration {recording.duration}"
+            raise ValueError(msg)  # noqa: TRY301
 
         text = re.sub("_", " ", text)  # "_" is treated as padding symbol
         text = re.sub(r"\s+", " ", text)  # remove extra whitespace
@@ -162,11 +124,11 @@ def _parse_supervision(
             text=text.strip(),
         )
     except Exception as e:
-        logging.warning(f"Error processing line: {e}")
+        log.warning("error_processing_line", error=str(e))
         return None
 
 
-def prepare_dataset(
+def prepare_dataset(  # noqa: PLR0913
     tsv_path: Pathlike,
     prefix: str,
     subset: str,
@@ -174,26 +136,25 @@ def prepare_dataset(
     num_jobs: int,
     output_dir: Pathlike,
 ):
-    """
-    Returns the manifests which consist of the Recordings and Supervisions
+    """Returns the manifests which consist of the Recordings and Supervisions.
 
     :param tsv_path: Path to the TSV file
     :param output_dir: Path where to write the manifests
     :param num_jobs: Number of processes for parallel processing
     :return: The CutSet containing the data
     """
-    logging.info(f"Preparing {prefix} dataset {subset} subset.")
+    log.info("preparing_dataset", prefix=prefix, subset=subset)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     file_name = f"{prefix}_cuts_{subset}.jsonl.gz"
     if (output_dir / file_name).is_file():
-        logging.info(f"{file_name} exists, skipping.")
+        log.info("file_exists_skipping", file_name=file_name)
         return
 
     # Step 1: Read all unique recording paths
     recordings_path_set = set()
     supervision_list = list()
-    with open(tsv_path, "r") as fr:
+    with open(tsv_path) as fr:
         for line in fr:
             items = line.strip().split("\t")
             if len(items) == 3:
@@ -203,41 +164,41 @@ def prepare_dataset(
                 uniq_id, text, wav_path, start, end = items
                 start, end = float(start), float(end)
             else:
-                raise ValueError(
-                    f"Invalid line format: {line},"
-                    "requries to be 3 columns or 5 columns"
-                )
+                msg = f"Invalid line format: {line}, requires to be 3 columns or 5 columns"
+                raise ValueError(msg)
             recordings_path_set.add(wav_path)
             supervision_list.append((uniq_id, text, wav_path, start, end))
 
-    logging.info("Starting to process recordings...")
+    log.info("starting_to_process_recordings")
     # Step 2: Process recordings
     futures = []
     recording_dict = {}
     with ThreadPoolExecutor(max_workers=num_jobs) as ex:
-        for wav_path in tqdm(recordings_path_set, desc="Submitting jobs"):
+        for wav_path in track(recordings_path_set, description="Submitting jobs"):
             futures.append(ex.submit(_parse_recording, wav_path))
 
-        for future in tqdm(futures, desc="Processing recordings"):
+        for future in track(futures, description="Processing recordings"):
             try:
                 recording, recording_id = future.result()
                 recording_dict[recording_id] = recording
             except Exception as e:
-                logging.warning(
-                    f"Error processing recording {recording_id} with error: {e}"
+                log.warning(
+                    "error_processing_recording",
+                    recording_id=recording_id,
+                    error=str(e),
                 )
 
         recording_set = RecordingSet.from_recordings(recording_dict.values())
 
-    logging.info("Starting to process supervisions...")
+    log.info("starting_to_process_supervisions")
     # Step 3: Process supervisions
     supervisions = []
-    for supervision in tqdm(supervision_list, desc="Processing supervisions"):
+    for supervision in track(supervision_list, description="Processing supervisions"):
         seg = _parse_supervision(supervision, recording_dict)
         if seg is not None:
             supervisions.append(seg)
 
-    logging.info("Processing Cuts...")
+    log.info("processing_cuts")
 
     # Step 4: Create and validate manifests
     supervision_set = SupervisionSet.from_segments(supervisions)
@@ -245,30 +206,57 @@ def prepare_dataset(
     recording_set, supervision_set = fix_manifests(recording_set, supervision_set)
     validate_recordings_and_supervisions(recording_set, supervision_set)
 
-    cut_set = CutSet.from_manifests(
-        recordings=recording_set, supervisions=supervision_set
-    )
+    cut_set = CutSet.from_manifests(recordings=recording_set, supervisions=supervision_set)
     cut_set = cut_set.sort_by_recording_id()
     cut_set = cut_set.resample(sampling_rate)
     cut_set = cut_set.trim_to_supervisions(keep_overlapping=False)
 
-    logging.info(f"Saving file to {output_dir / file_name}")
+    log.info("saving_file", path=str(output_dir / file_name))
     # Step 5: Write manifests to disk
     cut_set.to_file(output_dir / file_name)
-    logging.info("Done!")
+    log.info("done")
+
+
+@app.command()
+def main(  # noqa: PLR0913
+    tsv_path: str = typer.Option(  # noqa: B008
+        ...,
+        "--tsv-path",
+        help="The path of the tsv file. Each line should be in the format: "
+        "{uniq_id}\t{text}\t{wav_path}\t{start_time}\t{end_time} "
+        "if text corresponds to part of the wav or {uniq_id}\t{text}\t{wav_path} "
+        "if the text corresponds to the full wav",
+    ),
+    prefix: str = typer.Option(  # noqa: B008
+        "custom", "--prefix", help="Prefix of the output manifest file."
+    ),
+    subset: str = typer.Option(  # noqa: B008
+        "train", "--subset", help="Subset name manifest file, typically train or dev."
+    ),
+    num_jobs: int = typer.Option(  # noqa: B008
+        20, "--num-jobs", help="Number of jobs to processing."
+    ),
+    output_dir: str = typer.Option(  # noqa: B008
+        "data/manifests",
+        "--output-dir",
+        help="The destination directory of manifest files.",
+    ),
+    sampling_rate: int = typer.Option(  # noqa: B008
+        24000, "--sampling-rate", help="The target sampling rate."
+    ),
+) -> None:
+    """Prepare lhotse manifest files from TSV files for a custom dataset."""
+    prepare_dataset(
+        tsv_path=tsv_path,
+        prefix=prefix,
+        subset=subset,
+        sampling_rate=sampling_rate,
+        num_jobs=num_jobs,
+        output_dir=output_dir,
+    )
 
 
 if __name__ == "__main__":
-    formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
-    logging.basicConfig(format=formatter, level=logging.INFO, force=True)
+    app()
 
-    args = get_args()
-
-    prepare_dataset(
-        tsv_path=args.tsv_path,
-        prefix=args.prefix,
-        subset=args.subset,
-        sampling_rate=args.sampling_rate,
-        num_jobs=args.num_jobs,
-        output_dir=args.output_dir,
-    )
+# end zipvoice/bin/prepare_dataset.py

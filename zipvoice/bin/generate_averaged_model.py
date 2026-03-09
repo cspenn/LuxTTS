@@ -1,3 +1,4 @@
+# start zipvoice/bin/generate_averaged_model.py
 #!/usr/bin/env python3
 #
 # Copyright 2021-2022 Xiaomi Corporation
@@ -15,8 +16,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-Usage:
+"""Load checkpoints and average them.
+
 This script loads checkpoints and averages them.
 
 python3 -m zipvoice.bin.generate_averaged_model  \
@@ -29,12 +30,12 @@ It will generate a file `epoch-11-avg-14.pt` in the given `exp_dir`.
 You can later load it by `torch.load("epoch-11-avg-4.pt")`.
 """
 
-import argparse
-import json
-import logging
 from pathlib import Path
 
+import orjson
+import structlog
 import torch
+import typer
 
 from zipvoice.models.zipvoice import ZipVoice
 from zipvoice.models.zipvoice_dialog import ZipVoiceDialog, ZipVoiceDialogStereo
@@ -46,73 +47,48 @@ from zipvoice.utils.checkpoint import (
 )
 from zipvoice.utils.common import AttributeDict
 
-
-def get_parser():
-    parser = argparse.ArgumentParser(
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
-    )
-
-    parser.add_argument(
-        "--epoch",
-        type=int,
-        default=11,
-        help="""It specifies the checkpoint to use for decoding.
-        Note: Epoch counts from 1.
-        You can specify --avg to use more checkpoints for model averaging.""",
-    )
-
-    parser.add_argument(
-        "--iter",
-        type=int,
-        default=0,
-        help="""If positive, --epoch is ignored and it
-        will use the checkpoint exp_dir/checkpoint-iter.pt.
-        You can specify --avg to use more checkpoints for model averaging.
-        """,
-    )
-
-    parser.add_argument(
-        "--avg",
-        type=int,
-        default=4,
-        help="Number of checkpoints to average. Automatically select "
-        "consecutive checkpoints before the checkpoint specified by "
-        "'--epoch' or --iter",
-    )
-
-    parser.add_argument(
-        "--exp-dir",
-        type=str,
-        default="exp/zipvoice",
-        help="The experiment dir",
-    )
-
-    parser.add_argument(
-        "--model-name",
-        type=str,
-        default="zipvoice",
-        choices=[
-            "zipvoice",
-            "zipvoice_distill",
-            "zipvoice_dialog",
-            "zipvoice_dialog_stereo",
-        ],
-        help="The model type to be averaged. ",
-    )
-
-    return parser
+log = structlog.get_logger()
 
 
+app = typer.Typer(help="Load checkpoints and average them.", add_completion=False)
+
+
+@app.command()
 @torch.no_grad()
-def main():
-    parser = get_parser()
-    args = parser.parse_args()
+def main(  # noqa: PLR0912, PLR0915, C901
+    epoch: int = typer.Option(  # noqa: B008
+        11,
+        "--epoch",
+        help="It specifies the checkpoint to use for decoding. Note: Epoch counts "
+        "from 1. You can specify --avg to use more checkpoints for model averaging.",
+    ),
+    iter: int = typer.Option(  # noqa: B008
+        0,
+        "--iter",
+        help="If positive, --epoch is ignored and it will use the checkpoint "
+        "exp_dir/checkpoint-iter.pt. You can specify --avg to use more checkpoints "
+        "for model averaging.",
+    ),
+    avg: int = typer.Option(  # noqa: B008
+        4,
+        "--avg",
+        help="Number of checkpoints to average. Automatically select consecutive "
+        "checkpoints before the checkpoint specified by '--epoch' or --iter",
+    ),
+    exp_dir: str = typer.Option(  # noqa: B008
+        "exp/zipvoice", "--exp-dir", help="The experiment dir"
+    ),
+    model_name: str = typer.Option(  # noqa: B008
+        "zipvoice", "--model-name", help="The model type to be averaged."
+    ),
+) -> None:
+    """Load model checkpoints, average them, and save the result."""
     params = AttributeDict()
-    params.update(vars(args))
+    params.update({"epoch": epoch, "iter": iter, "avg": avg, "exp_dir": exp_dir, "model_name": model_name})
     params.exp_dir = Path(params.exp_dir)
 
-    with open(params.exp_dir / "model.json", "r") as f:
-        model_config = json.load(f)
+    with open(params.exp_dir / "model.json", "rb") as f:
+        model_config = orjson.loads(f.read())
 
     # Any tokenizer can be used here.
     # Use SimpleTokenizer for simplicity.
@@ -132,12 +108,12 @@ def main():
 
     params.suffix = f"epoch-{params.epoch}-avg-{params.avg}"
 
-    logging.info("Script started")
+    log.info("script_started")
 
     params.device = torch.device("cpu")
-    logging.info(f"Device: {params.device}")
+    log.info("device", device=str(params.device))
 
-    logging.info("About to create model")
+    log.info("about_to_create_model")
     if params.model_name == "zipvoice":
         model = ZipVoice(
             **model_config["model"],
@@ -159,26 +135,23 @@ def main():
             **tokenizer_config,
         )
     else:
-        raise ValueError(f"Unknown model name: {params.model_name}")
+        msg = f"Unknown model name: {params.model_name}"
+        raise ValueError(msg)
 
     if params.iter > 0:
-        filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[
-            : params.avg + 1
-        ]
+        filenames = find_checkpoints(params.exp_dir, iteration=-params.iter)[: params.avg + 1]
         if len(filenames) == 0:
-            raise ValueError(
-                f"No checkpoints found for" f" --iter {params.iter}, --avg {params.avg}"
-            )
+            msg = f"No checkpoints found for --iter {params.iter}, --avg {params.avg}"
+            raise ValueError(msg)
         elif len(filenames) < params.avg + 1:
-            raise ValueError(
-                f"Not enough checkpoints ({len(filenames)}) found for"
-                f" --iter {params.iter}, --avg {params.avg}"
-            )
+            msg = f"Not enough checkpoints ({len(filenames)}) found for --iter {params.iter}, --avg {params.avg}"
+            raise ValueError(msg)
         filename_start = filenames[-1]
         filename_end = filenames[0]
-        logging.info(
-            "Calculating the averaged model over iteration checkpoints"
-            f" from {filename_start} (excluded) to {filename_end}"
+        log.info(
+            "averaging_iteration_checkpoints",
+            filename_start=str(filename_start),
+            filename_end=str(filename_end),
         )
         model.to(params.device)
         model.load_state_dict(
@@ -190,14 +163,19 @@ def main():
             strict=True,
         )
     else:
-        assert params.avg > 0, params.avg
+        if params.avg <= 0:
+            msg = f"avg must be > 0, got {params.avg}"
+            raise ValueError(msg)
         start = params.epoch - params.avg
-        assert start >= 1, start
+        if start < 1:
+            msg = f"start epoch must be >= 1, got {start}"
+            raise ValueError(msg)
         filename_start = f"{params.exp_dir}/epoch-{start}.pt"
         filename_end = f"{params.exp_dir}/epoch-{params.epoch}.pt"
-        logging.info(
-            f"Calculating the averaged model over epoch range from "
-            f"{start} (excluded) to {params.epoch}"
+        log.info(
+            "averaging_epoch_checkpoints",
+            start=start,
+            epoch=params.epoch,
         )
         model.to(params.device)
         model.load_state_dict(
@@ -213,17 +191,16 @@ def main():
     else:
         filename = params.exp_dir / f"epoch-{params.epoch}-avg-{params.avg}.pt"
 
-    logging.info(f"Saving the averaged checkpoint to {filename}")
+    log.info("saving_averaged_checkpoint", filename=str(filename))
     torch.save({"model": model.state_dict()}, filename)
 
     num_param = sum([p.numel() for p in model.parameters()])
-    logging.info(f"Number of model parameters: {num_param}")
+    log.info("model_parameters", num_param=num_param)
 
-    logging.info("Done!")
+    log.info("done")
 
 
 if __name__ == "__main__":
-    formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
-    logging.basicConfig(format=formatter, level=logging.INFO, force=True)
+    app()
 
-    main()
+# end zipvoice/bin/generate_averaged_model.py
